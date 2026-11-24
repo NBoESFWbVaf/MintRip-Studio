@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <radialGradient id="discBg" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#8CE05B" />
+      <stop offset="55%" stop-color="#5BA632" />
+      <stop offset="100%" stop-color="#2E6B14" />
+    </radialGradient>
+    <linearGradient id="discSheen" x1="12" y1="8" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.38" />
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.04" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.22" />
+    </linearGradient>
+  </defs>
+  <circle cx="32" cy="32" r="29" fill="url(#discBg)" stroke="#1F4A0D" stroke-width="2" />
+  <circle cx="32" cy="32" r="27" fill="url(#discSheen)" />
+  <path d="M17 17 A21 21 0 0 1 36 11" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.65" />
+  <path d="M47 47 A21 21 0 0 1 28 53" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.45" />
+  <circle cx="32" cy="32" r="11" fill="#F4F5F6" fill-opacity="0.28" stroke="#FFFFFF" stroke-width="1.5" stroke-opacity="0.7" />
+  <circle cx="32" cy="32" r="5.5" fill="#1C1F23" stroke="#FFFFFF" stroke-width="1.5" />
+</svg>

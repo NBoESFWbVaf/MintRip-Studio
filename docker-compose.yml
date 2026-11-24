@@ -1,0 +1,13 @@
+services:
+  mintrip-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mintrip-studio
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      # Optionaler persönlicher Discogs-API-Token (alternativ direkt in den Webapp-Einstellungen hinterlegbar):
+      # - DISCOGS_TOKEN=dein_token
+    restart: unless-stopped

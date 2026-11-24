@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MintRip Studio
+GenericName=CD-Ripper & Audio-Konverter
+Comment=Audio-CDs bitgenau rippen, Metadaten verwalten und nach FLAC/MP3 exportieren
+Exec=EXEC_PATH
+Icon=drive-optical
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;DiscBurning;GTK;
+Keywords=CD;Ripper;FLAC;MP3;MusicBrainz;CDDB;cdparanoia;
+StartupNotify=true
