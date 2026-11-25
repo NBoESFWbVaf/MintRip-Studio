@@ -276,6 +276,11 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self._track_rg_display_open: bool = False
         self._preview_request_gen: int = 0
         self._last_preview_key: str = ""
+        self._db_progress_tasks: dict[str, dict] = {}
+        self._db_progress_seq: int = 0
+        self._db_progress_pulse_id: int = 0
+        self._db_progress_hide_id: int = 0
+        self._db_progress_notice: Optional[tuple[str, bool]] = None
         self.connect("destroy", self._on_main_window_destroy)
 
         self._build_layout()
@@ -2083,6 +2088,12 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self.hits_search_overlay_box.set_no_show_all(True)
         self.hits_search_overlay_box.hide()
         self.hits_overlay.add_overlay(self.hits_search_overlay_box)
+        self.hits_dnd_overlay_box = self._build_dnd_overlay_box(
+            "Album-Ordner hier ablegen",
+            "Aktuelle Liste wird geleert &amp; Online-Abfrage gestartet",
+        )
+        self.hits_overlay.add_overlay(self.hits_dnd_overlay_box)
+        self.hits_overlay.set_overlay_pass_through(self.hits_dnd_overlay_box, True)
         hits_vbox.pack_start(self.hits_overlay, True, True, 0)
 
         hits_action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -2098,10 +2109,12 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self.hits_frame.add(hits_vbox)
         self.hits_body.pack_start(self.hits_frame, True, True, 0)
 
-        # Modul 3: Drag & Drop auch in der Albenliste (Ordner/Dateien -> Felder zurücksetzen + automatische Online-Abfrage mit Overlay)
-        attach_audio_file_drop_target(self.hits_body, self._on_hits_audio_files_dropped)
-        attach_audio_file_drop_target(hits_scroll, self._on_hits_audio_files_dropped)
-        attach_audio_file_drop_target(self.hits_treeview, self._on_hits_audio_files_dropped)
+        # Modul 3: Drag & Drop auch in der Albenliste (leichtes Overlay mit Icon -> Liste leeren + automatische Online-Abfrage)
+        self._dnd_hide_timers: dict[str, int] = {}
+        on_hits_hover = lambda active: self._set_module3_dnd_overlay("hits", active)
+        attach_audio_file_drop_target(self.hits_body, self._on_hits_audio_files_dropped, on_drag_hover=on_hits_hover)
+        attach_audio_file_drop_target(hits_scroll, self._on_hits_audio_files_dropped, on_drag_hover=on_hits_hover)
+        attach_audio_file_drop_target(self.hits_treeview, self._on_hits_audio_files_dropped, on_drag_hover=on_hits_hover)
 
         hits_card_vbox.pack_start(self.hits_body, True, True, 0)
         self.hits_frame_box.add(hits_card_vbox)
@@ -2348,8 +2361,19 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self.track_listbox = Gtk.ListBox()
         self.track_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
         track_scroll.add(self.track_listbox)
-        track_drop_box.add(track_scroll)
-        attach_audio_file_drop_target(track_drop_box, self._on_audio_files_dropped)
+        self.track_overlay = Gtk.Overlay()
+        self.track_overlay.add(track_scroll)
+        self.track_dnd_overlay_box = self._build_dnd_overlay_box(
+            "Album-Ordner hier ablegen",
+            "Aktuelle Liste wird geleert &amp; Titel werden geladen",
+        )
+        self.track_overlay.add_overlay(self.track_dnd_overlay_box)
+        self.track_overlay.set_overlay_pass_through(self.track_dnd_overlay_box, True)
+        track_drop_box.add(self.track_overlay)
+        on_track_hover = lambda active: self._set_module3_dnd_overlay("tracks", active)
+        attach_audio_file_drop_target(track_drop_box, self._on_audio_files_dropped, on_drag_hover=on_track_hover)
+        attach_audio_file_drop_target(track_scroll, self._on_audio_files_dropped, on_drag_hover=on_track_hover)
+        attach_audio_file_drop_target(self.track_listbox, self._on_audio_files_dropped, on_drag_hover=on_track_hover)
         self.track_body.pack_start(track_drop_box, True, True, 0)
 
         # Fußzeile von Display 2: Optionaler WAV->FLAC Konvertierungs-Schalter in Modul 3 + Aktion
@@ -3046,9 +3070,51 @@ class MintRipWindow(Gtk.ApplicationWindow):
 
         self.window_vpaned.pack2(self.query_log_panel, resize=False, shrink=False)
 
+        # Dauerhafte Fortschrittsleiste am unteren Fensterrand für alle Datenbankabfragen
+        # (immer sichtbar am unteren Rand, unabhängig vom Abfrage-Protokoll)
+        self.db_query_progress_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.db_query_progress_box.set_size_request(-1, 32)
+        self.db_query_progress_box.get_style_context().add_class("db-query-progress-strip")
+
+        self.db_progress_spinner = Gtk.Spinner()
+        self.db_progress_spinner.set_size_request(16, 16)
+        self.db_progress_spinner.set_valign(Gtk.Align.CENTER)
+        self.db_progress_spinner.set_no_show_all(True)
+        self.db_query_progress_box.pack_start(self.db_progress_spinner, False, False, 0)
+
+        self.db_progress_glyph = Gtk.Label(label="●")
+        self.db_progress_glyph.set_valign(Gtk.Align.CENTER)
+        self.db_progress_glyph.get_style_context().add_class("dim-label")
+        self.db_query_progress_box.pack_start(self.db_progress_glyph, False, False, 0)
+
+        self.db_progress_label = Gtk.Label(label="Bereit — keine aktive Datenbankabfrage")
+        self.db_progress_label.set_xalign(0)
+        self.db_progress_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.db_progress_label.set_hexpand(True)
+        self.db_progress_label.get_style_context().add_class("dim-label")
+        self.db_query_progress_box.pack_start(self.db_progress_label, True, True, 0)
+
+        self.db_progress_bar = Gtk.ProgressBar()
+        self.db_progress_bar.set_size_request(280, 14)
+        self.db_progress_bar.set_valign(Gtk.Align.CENTER)
+        self.db_progress_bar.set_pulse_step(0.06)
+        self.db_progress_bar.set_fraction(0.0)
+        self.db_progress_bar.get_style_context().add_class("db-query-progress-bar")
+        self.db_query_progress_box.pack_start(self.db_progress_bar, False, False, 0)
+
+        self.db_progress_pct_label = Gtk.Label(label="Bereit")
+        self.db_progress_pct_label.set_xalign(1.0)
+        self.db_progress_pct_label.set_width_chars(14)
+        self.db_progress_pct_label.get_style_context().add_class("dim-label")
+        self.db_query_progress_box.pack_start(self.db_progress_pct_label, False, False, 0)
+
+        self.db_progress_spinner.hide()
+        main_vbox.pack_end(self.db_query_progress_box, False, False, 0)
+
     def _on_main_window_destroy(self, _w: Gtk.Widget) -> None:
         self._stop_tray_polling()
         self._stop_track_preview(log=False)
+        self._db_progress_stop_timers()
         with self._rep_pending_lock:
             if self._rep_flush_timer_id:
                 GLib.source_remove(self._rep_flush_timer_id)
@@ -6432,6 +6498,12 @@ class MintRipWindow(Gtk.ApplicationWindow):
             getattr(self.settings, "shazam_sample_size", DEFAULT_SHAZAM_SAMPLE_SIZE)
         )
         selected_drive = self._get_selected_drive()
+        self._db_progress_start(
+            "shazam",
+            f"Shazam-Abfrage: 0/{total_sel} Titel…",
+            total=total_sel,
+            current=0,
+        )
         self._append_query_log_ui(
             f"[Shazam] Starte schlüssellose Shazam-Abfrage für {total_sel} ausgewählte Titel (Track-Mitte 50 %, Samplegröße: {shazam_sample_size} Samples / {shazam_sample_size / 16000.0:.1f}s)..."
         )
@@ -6444,6 +6516,14 @@ class MintRipWindow(Gtk.ApplicationWindow):
                     if cancel_evt.is_set():
                         break
                     processed_count += 1
+                    trk_name = (trk.title or "").strip() or f"Track #{trk.track_number:02d}"
+                    GLib.idle_add(
+                        self._db_progress_update,
+                        "shazam",
+                        processed_count - 1,
+                        total_sel,
+                        f"Shazam-Abfrage ({processed_count}/{total_sel}): „{trk_name}“…",
+                    )
                     res = recognize_track_with_shazam(
                         trk,
                         album=self.album,
@@ -6456,6 +6536,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
                         matched_count += 1
                         GLib.idle_add(self._apply_shazam_result_to_track, idx, res)
                         GLib.idle_add(self._populate_album_ui)
+                    GLib.idle_add(
+                        self._db_progress_update,
+                        "shazam",
+                        processed_count,
+                        total_sel,
+                        f"Shazam-Abfrage ({processed_count}/{total_sel}): „{trk_name}“",
+                    )
                     if cancel_evt.is_set():
                         break
             except Exception as exc:
@@ -6473,10 +6560,19 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 self._populate_album_ui()
                 self._sync_select_all_state()
                 if was_cancelled:
+                    self._db_progress_finish(
+                        "shazam",
+                        f"Shazam abgebrochen ({matched_count}/{processed_count} Treffer)",
+                        cancelled=True,
+                    )
                     self._append_query_log_ui(
                         f"[Shazam] Abfrage vom Benutzer gestoppt ({matched_count} von {processed_count} geprüften / {total_sel} ausgewählten Titeln identifiziert; bisherige Treffer bleiben erhalten)."
                     )
                 else:
+                    self._db_progress_finish(
+                        "shazam",
+                        f"Shazam abgeschlossen: {matched_count}/{total_sel} Titel identifiziert",
+                    )
                     self._append_query_log_ui(
                         f"[Shazam] Abfrage abgeschlossen: {matched_count} von {total_sel} ausgewählten Titeln erfolgreich über Shazam identifiziert."
                     )
@@ -6595,6 +6691,12 @@ class MintRipWindow(Gtk.ApplicationWindow):
 
         total_sel = len(selected_entries)
         fallback_artist = (self.album.artist or self.album.album_artist or "").strip()
+        self._db_progress_start(
+            "mb_tracks",
+            f"MusicBrainz Einzelanalyse: 0/{total_sel} Titel…",
+            total=total_sel,
+            current=0,
+        )
         self._append_query_log_ui(
             f"[MusicBrainz Einzeltracks] Starte Einzeltrackanalyse für {total_sel} per Checkbox ausgewählte(n) Titel (befüllt Interpret, Titel & Genre)..."
         )
@@ -6607,6 +6709,14 @@ class MintRipWindow(Gtk.ApplicationWindow):
                     if cancel_evt.is_set():
                         break
                     processed_count += 1
+                    trk_name = (trk.title or "").strip() or f"Track #{trk.track_number:02d}"
+                    GLib.idle_add(
+                        self._db_progress_update,
+                        "mb_tracks",
+                        processed_count - 1,
+                        total_sel,
+                        f"MusicBrainz Einzelanalyse ({processed_count}/{total_sel}): „{trk_name}“…",
+                    )
                     res = analyze_single_track_musicbrainz(
                         trk,
                         fallback_artist=fallback_artist,
@@ -6617,6 +6727,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
                         matched_count += 1
                         GLib.idle_add(self._apply_mb_single_track_result, idx, res)
                         GLib.idle_add(self._populate_album_ui)
+                    GLib.idle_add(
+                        self._db_progress_update,
+                        "mb_tracks",
+                        processed_count,
+                        total_sel,
+                        f"MusicBrainz Einzelanalyse ({processed_count}/{total_sel}): „{trk_name}“",
+                    )
             except InterruptedError:
                 pass
             except Exception as exc:
@@ -6634,10 +6751,19 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 self._populate_album_ui()
                 self._sync_select_all_state()
                 if was_cancelled:
+                    self._db_progress_finish(
+                        "mb_tracks",
+                        f"MusicBrainz Einzelanalyse abgebrochen ({matched_count}/{processed_count} aktualisiert)",
+                        cancelled=True,
+                    )
                     self._append_query_log_ui(
                         f"[MusicBrainz Einzeltracks] Analyse vom Benutzer gestoppt ({matched_count} von {processed_count} geprüften / {total_sel} ausgewählten Titeln aktualisiert)."
                     )
                 else:
+                    self._db_progress_finish(
+                        "mb_tracks",
+                        f"MusicBrainz Einzelanalyse abgeschlossen: {matched_count}/{total_sel} Titel aktualisiert",
+                    )
                     self._append_query_log_ui(
                         f"[MusicBrainz Einzeltracks] Abgeschlossen: {matched_count} von {total_sel} ausgewählten Titeln erfolgreich aktualisiert (Interpret, Titel & Genre)."
                     )
@@ -6742,6 +6868,10 @@ class MintRipWindow(Gtk.ApplicationWindow):
         )
         active_lbl.set_text(busy_txt)
         target_album = self.album
+        self._db_progress_start(
+            "verify",
+            f"{noun}-Prüfung läuft (MusicBrainz & Wikidata)…",
+        )
 
         def worker() -> None:
             try:
@@ -6758,6 +6888,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 )
 
             def finish() -> bool:
+                was_cancelled = cancel_evt.is_set()
                 self._verify_cancel_event = None
                 self.verify_stop_btn.hide()
                 self.verify_stop_btn.set_no_show_all(True)
@@ -6765,6 +6896,17 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 for b in all_verify_btns:
                     b.set_sensitive(True)
                 self._populate_album_ui()
+                if was_cancelled:
+                    self._db_progress_finish(
+                        "verify",
+                        f"{noun}-Prüfung abgebrochen",
+                        cancelled=True,
+                    )
+                else:
+                    self._db_progress_finish(
+                        "verify",
+                        f"{noun}-Prüfung abgeschlossen",
+                    )
                 return False
 
             GLib.idle_add(finish)
@@ -6936,6 +7078,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self._set_cover_search_running_ui(False)
         self._set_hits_search_running_ui(False)
         self._set_preview_overlays_ui(left=False, right=False)
+        self._db_progress_clear_all()
         self._reset_all_fields_state(emit_log=False)
         if hasattr(self, "convert_local_flac_chk"):
             self.convert_local_flac_chk.set_active(False)
@@ -7436,6 +7579,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
             right_title="Trackliste wird abgefragt…",
             right_sub="Enthaltene Titel werden geladen",
         )
+        preview_title_txt = " – ".join(
+            p for p in (str(cand.get("artist") or "").strip(), str(cand.get("title") or "").strip()) if p
+        )
+        self._db_progress_start(
+            "preview",
+            f"Album-Vorschau wird geladen… ({preview_title_txt})" if preview_title_txt else "Album-Vorschau wird geladen…",
+        )
         discogs_tok = self.settings.discogs_token
 
         def _load_cover_bg(c_url: str) -> None:
@@ -7447,6 +7597,10 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 if img_data:
                     self._set_left_preview_cover_bytes(img_data)
                 self._set_preview_overlays_ui(left=False)
+                self._db_progress_finish(
+                    "preview",
+                    f"Album-Vorschau geladen: {preview_title_txt}" if preview_title_txt else "Album-Vorschau geladen",
+                )
                 return False
 
             GLib.idle_add(_apply_cover)
@@ -7464,6 +7618,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
                     return False
                 if err_msg or data is None:
                     self._set_preview_overlays_ui(left=False, right=False)
+                    self._db_progress_finish("preview", "Album-Vorschau nicht verfügbar")
                     self._render_left_album_preview(
                         cand,
                         preview_data=None,
@@ -7500,6 +7655,10 @@ class MintRipWindow(Gtk.ApplicationWindow):
                         threading.Thread(target=_load_cover_bg, args=(c_url,), daemon=True).start()
                     else:
                         self._set_preview_overlays_ui(left=False)
+                        self._db_progress_finish(
+                            "preview",
+                            f"Album-Vorschau geladen: {preview_title_txt}" if preview_title_txt else "Album-Vorschau geladen",
+                        )
                 return False
 
             GLib.idle_add(_apply_on_main)
@@ -7581,6 +7740,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 )
 
             def _finish_on_main() -> bool:
+                if resolved_album is not None:
+                    self._db_progress_finish(
+                        "hits",
+                        f"Album geladen: {resolved_album.artist} – {resolved_album.title} ({len(resolved_album.tracks)} Titel)",
+                    )
+                else:
+                    self._db_progress_finish("hits", "Album konnte nicht geladen werden")
                 self._set_hits_search_running_ui(False)
                 self._set_preview_overlays_ui(left=False, right=False)
                 if resolved_album is not None:
@@ -7636,6 +7802,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 self._append_query_log_threadsafe(f"[Datenbank-Suche] Fehler: {exc}")
 
             def _finish_search() -> bool:
+                if cands is not None:
+                    self._db_progress_finish(
+                        "hits",
+                        f"Datenbanksuche abgeschlossen: {len(cands)} Album-Treffer gefunden",
+                    )
+                else:
+                    self._db_progress_finish("hits", "Datenbanksuche fehlgeschlagen")
                 self._set_hits_search_running_ui(False)
                 if cands is not None:
                     self._populate_candidate_hits_ui(cands)
@@ -7662,6 +7835,10 @@ class MintRipWindow(Gtk.ApplicationWindow):
         discogs_token = self.settings.discogs_token
         lastfm_api_key = str(getattr(self.settings, "lastfm_api_key", "") or "")
         prefer_subgenres = bool(getattr(self.settings, "prefer_subgenres", True))
+        self._db_progress_start(
+            "enrich",
+            f"Track-Genres werden angereichert ({len(current_album.tracks)} Tracks · MusicBrainz · Discogs · Last.fm)…",
+        )
         self._append_query_log_ui(
             f"[Track-Genre-Enrichment] Starte Multi-Source-Genre-Abfrage für „{current_album.artist} – {current_album.title}“ ({len(current_album.tracks)} Tracks)..."
         )
@@ -7686,6 +7863,10 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 self._populate_album_ui()
                 updated_cnt = int(summary.get("updated_tracks", 0) or 0)
                 srcs = ", ".join(summary.get("sources") or []) or "keine neuen Quellen"
+                self._db_progress_finish(
+                    "enrich",
+                    f"Track-Genres abgeschlossen: {updated_cnt} Titel aktualisiert ({srcs})",
+                )
                 self._append_query_log_ui(
                     f"[Track-Genre-Enrichment] Fertig: {updated_cnt} Track-Genres aktualisiert ({srcs})."
                 )
@@ -7750,6 +7931,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
                         )
 
             def _finish_retry() -> bool:
+                if cands is not None:
+                    self._db_progress_finish(
+                        "hits",
+                        f"Datenbankabfrage abgeschlossen: {len(cands)} Album-Treffer gefunden",
+                    )
+                else:
+                    self._db_progress_finish("hits", "Datenbankabfrage fehlgeschlagen")
                 self._set_hits_search_running_ui(False)
                 if cands is not None:
                     self._populate_candidate_hits_ui(cands)
@@ -7839,7 +8027,17 @@ class MintRipWindow(Gtk.ApplicationWindow):
                             on_log=self._append_query_log_threadsafe,
                         )
                         GLib.idle_add(self._populate_candidate_hits_ui, cands)
+                        GLib.idle_add(
+                            self._db_progress_finish,
+                            "hits",
+                            f"Datenbankabfrage abgeschlossen: {len(cands)} Album-Treffer gefunden",
+                        )
                     except Exception as exc:
+                        GLib.idle_add(
+                            self._db_progress_finish,
+                            "hits",
+                            "Datenbankabfrage fehlgeschlagen",
+                        )
                         self._append_query_log_threadsafe(
                             f"[TOC-Abfrage] Online-Abfrage fehlgeschlagen ({exc}) – über 'Erneut versuchen' jederzeit wiederholbar."
                         )
@@ -8008,6 +8206,11 @@ class MintRipWindow(Gtk.ApplicationWindow):
                         on_log=self._append_query_log_threadsafe,
                     )
                     GLib.idle_add(self._populate_candidate_hits_ui, cands)
+                    GLib.idle_add(
+                        self._db_progress_finish,
+                        "hits",
+                        f"CD-Datenbankabfrage abgeschlossen: {len(cands)} Album-Treffer gefunden",
+                    )
                 except Exception as cd_exc:
                     if current_album.tracks:
                         synthesize_toc_from_tracks(current_album)
@@ -8029,7 +8232,17 @@ class MintRipWindow(Gtk.ApplicationWindow):
                             on_log=self._append_query_log_threadsafe,
                         )
                         GLib.idle_add(self._populate_candidate_hits_ui, cands)
+                        GLib.idle_add(
+                            self._db_progress_finish,
+                            "hits",
+                            f"Datenbankabfrage abgeschlossen: {len(cands)} Album-Treffer gefunden",
+                        )
                     except Exception as exc:
+                        GLib.idle_add(
+                            self._db_progress_finish,
+                            "hits",
+                            "Datenbankabfrage fehlgeschlagen",
+                        )
                         self._append_query_log_threadsafe(f"[Fehler] Datenbank-Abfrage fehlgeschlagen: {exc}")
             finally:
                 GLib.idle_add(self._set_hits_search_running_ui, False)
@@ -8079,6 +8292,11 @@ class MintRipWindow(Gtk.ApplicationWindow):
             return
         self._active_display = "hits"
         self._update_workspace_visibility_and_locks()
+        self._set_hits_search_running_ui(
+            True,
+            title=f"Barcode/QR-Code wird abgefragt ({clean_code})…",
+            subtitle="MusicBrainz · Discogs",
+        )
         current_album = self.album
         token = self.settings.discogs_token
         self._append_query_log_ui(
@@ -8086,6 +8304,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
         )
 
         def worker() -> None:
+            cands: Optional[list[dict]] = None
             try:
                 cands = search_all_databases_candidates(
                     current_album,
@@ -8093,9 +8312,23 @@ class MintRipWindow(Gtk.ApplicationWindow):
                     discogs_token=token,
                     on_log=self._append_query_log_threadsafe,
                 )
-                GLib.idle_add(self._populate_candidate_hits_ui, cands)
             except Exception as exc:
                 self._append_query_log_threadsafe(f"[Barcode/QR] Fehler bei der Abfrage: {exc}")
+
+            def _finish_barcode() -> bool:
+                if cands is not None:
+                    self._db_progress_finish(
+                        "hits",
+                        f"Barcode/QR-Abfrage abgeschlossen: {len(cands)} Treffer gefunden",
+                    )
+                else:
+                    self._db_progress_finish("hits", "Barcode/QR-Abfrage fehlgeschlagen")
+                self._set_hits_search_running_ui(False)
+                if cands is not None:
+                    self._populate_candidate_hits_ui(cands)
+                return False
+
+            GLib.idle_add(_finish_barcode)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -8338,6 +8571,10 @@ class MintRipWindow(Gtk.ApplicationWindow):
         disc_num = self.album.disc_number
         if not mbid:
             return
+        self._db_progress_start(
+            "disc_load",
+            f"Multi-CD: Trackliste für CD {disc_num} wird von MusicBrainz geladen…",
+        )
         self._append_query_log_ui(f"[Multi-CD] Lade Trackliste für CD {disc_num} von MusicBrainz (MBID {mbid})...")
         current_album = self.album
 
@@ -8352,7 +8589,17 @@ class MintRipWindow(Gtk.ApplicationWindow):
                         trk.start_lsn = current_album.tracks[idx].start_lsn
                         trk.end_lsn = current_album.tracks[idx].end_lsn
                 GLib.idle_add(self._apply_resolved_album, details)
+                GLib.idle_add(
+                    self._db_progress_finish,
+                    "disc_load",
+                    f"CD {disc_num} geladen ({len(details.tracks)} Titel)",
+                )
             except Exception as exc:
+                GLib.idle_add(
+                    self._db_progress_finish,
+                    "disc_load",
+                    f"CD {disc_num} konnte nicht geladen werden",
+                )
                 self._append_query_log_threadsafe(f"[Multi-CD] CD-Abruf fehlgeschlagen: {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -8466,6 +8713,192 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self._ensure_slow_spinner_running(self._any_slow_spinner_active())
         return False
 
+    def _db_progress_stop_timers(self, pulse: bool = True, hide: bool = True) -> None:
+        if pulse and getattr(self, "_db_progress_pulse_id", 0):
+            try:
+                GLib.source_remove(self._db_progress_pulse_id)
+            except Exception:
+                pass
+            self._db_progress_pulse_id = 0
+        if hide and getattr(self, "_db_progress_hide_id", 0):
+            try:
+                GLib.source_remove(self._db_progress_hide_id)
+            except Exception:
+                pass
+            self._db_progress_hide_id = 0
+
+    def _on_db_progress_pulse_tick(self) -> bool:
+        if not self._db_progress_tasks or not hasattr(self, "db_progress_bar"):
+            self._db_progress_pulse_id = 0
+            return False
+        self.db_progress_bar.pulse()
+        self.db_progress_bar.queue_draw()
+        return True
+
+    def _on_db_progress_auto_hide(self) -> bool:
+        self._db_progress_hide_id = 0
+        if self._db_progress_tasks:
+            return False
+        self._db_progress_notice = None
+        self._render_db_progress_bar()
+        return False
+
+    def _db_progress_start(
+        self,
+        key: str,
+        label: str,
+        total: int = 0,
+        current: int = 0,
+    ) -> bool:
+        self._db_progress_seq += 1
+        self._db_progress_notice = None
+        self._db_progress_stop_timers(pulse=False, hide=True)
+        self._db_progress_tasks[key] = {
+            "label": label,
+            "current": max(0, int(current)),
+            "total": max(0, int(total)),
+            "seq": self._db_progress_seq,
+        }
+        self._render_db_progress_bar()
+        return False
+
+    def _db_progress_update(
+        self,
+        key: str,
+        current: int,
+        total: int,
+        label: Optional[str] = None,
+    ) -> bool:
+        entry = self._db_progress_tasks.get(key)
+        if entry is None:
+            return self._db_progress_start(key, label or "Datenbankabfrage läuft…", total=total, current=current)
+        entry["current"] = max(0, int(current))
+        entry["total"] = max(0, int(total))
+        if label is not None:
+            entry["label"] = label
+        self._render_db_progress_bar()
+        return False
+
+    def _db_progress_finish(
+        self,
+        key: str,
+        summary: str = "",
+        cancelled: bool = False,
+    ) -> bool:
+        existed = self._db_progress_tasks.pop(key, None) is not None
+        if not existed and not summary:
+            return False
+        if self._db_progress_tasks:
+            self._render_db_progress_bar()
+            return False
+        if not existed:
+            return False
+        final_text = summary.strip() or (
+            "Datenbankabfrage abgebrochen" if cancelled else "Datenbankabfrage abgeschlossen"
+        )
+        self._db_progress_notice = (final_text, bool(cancelled))
+        self._render_db_progress_bar()
+        self._db_progress_stop_timers(pulse=True, hide=True)
+        delay_ms = 4000 if cancelled else 6000
+        self._db_progress_hide_id = GLib.timeout_add(delay_ms, self._on_db_progress_auto_hide)
+        return False
+
+    def _db_progress_clear_all(self) -> bool:
+        self._db_progress_tasks.clear()
+        self._db_progress_notice = None
+        self._db_progress_stop_timers(pulse=True, hide=True)
+        self._render_db_progress_bar()
+        return False
+
+    def _render_db_progress_bar(self) -> None:
+        if not hasattr(self, "db_query_progress_box"):
+            return
+        strip_ctx = self.db_query_progress_box.get_style_context()
+        lbl_ctx = self.db_progress_label.get_style_context()
+        glyph_ctx = self.db_progress_glyph.get_style_context()
+        for cls in ("db-progress-active", "db-progress-done", "db-progress-cancelled"):
+            strip_ctx.remove_class(cls)
+        for cls in ("dim-label", "db-progress-status-active", "db-progress-status-done", "db-progress-status-cancelled"):
+            lbl_ctx.remove_class(cls)
+            glyph_ctx.remove_class(cls)
+
+        self.db_query_progress_box.show()
+        self.db_progress_label.show()
+        self.db_progress_bar.show()
+        self.db_progress_pct_label.show()
+
+        if self._db_progress_tasks:
+            tasks = list(self._db_progress_tasks.values())
+            det_tasks = [t for t in tasks if t["total"] > 0]
+            active = max(det_tasks if det_tasks else tasks, key=lambda t: t["seq"])
+            extra_cnt = len(tasks) - 1
+            extra_suffix = (
+                f" (+{extra_cnt} weitere Abfrage)"
+                if extra_cnt == 1
+                else (f" (+{extra_cnt} weitere Abfragen)" if extra_cnt > 1 else "")
+            )
+            strip_ctx.add_class("db-progress-active")
+            lbl_ctx.add_class("db-progress-status-active")
+            self.db_progress_label.set_text(f"{active['label']}{extra_suffix}")
+            self.db_progress_glyph.hide()
+            self.db_progress_spinner.show()
+            self.db_progress_spinner.start()
+
+            if active["total"] > 0:
+                self._db_progress_stop_timers(pulse=True, hide=False)
+                raw_frac = max(0.0, min(1.0, active["current"] / float(active["total"])))
+                # Auch bei Schritt 0/N einen minimalen grünen Startbalken zeigen
+                vis_frac = max(0.05, raw_frac)
+                self.db_progress_bar.set_fraction(vis_frac)
+                pct = int(round(raw_frac * 100))
+                self.db_progress_pct_label.set_text(
+                    f"{active['current']}/{active['total']} · {pct} %"
+                )
+            else:
+                self.db_progress_pct_label.set_text("Läuft…")
+                if not self._db_progress_pulse_id:
+                    self.db_progress_bar.pulse()
+                    self._db_progress_pulse_id = GLib.timeout_add(
+                        65, self._on_db_progress_pulse_tick
+                    )
+            self.db_progress_bar.queue_draw()
+            return
+
+        if self._db_progress_notice is not None:
+            summary_txt, was_cancelled = self._db_progress_notice
+            self._db_progress_stop_timers(pulse=True, hide=False)
+            self.db_progress_spinner.stop()
+            self.db_progress_spinner.hide()
+            self.db_progress_glyph.set_text("■" if was_cancelled else "✓")
+            self.db_progress_glyph.show()
+            self.db_progress_label.set_text(summary_txt)
+            if was_cancelled:
+                strip_ctx.add_class("db-progress-cancelled")
+                lbl_ctx.add_class("db-progress-status-cancelled")
+                glyph_ctx.add_class("db-progress-status-cancelled")
+                self.db_progress_pct_label.set_text("Abgebrochen")
+            else:
+                strip_ctx.add_class("db-progress-done")
+                lbl_ctx.add_class("db-progress-status-done")
+                glyph_ctx.add_class("db-progress-status-done")
+                self.db_progress_bar.set_fraction(1.0)
+                self.db_progress_pct_label.set_text("100 %")
+            self.db_progress_bar.queue_draw()
+            return
+
+        # Ruhezustand: Leiste bleibt kompakt am unteren Fensterrand verankert
+        self._db_progress_stop_timers(pulse=True, hide=False)
+        self.db_progress_spinner.stop()
+        self.db_progress_spinner.hide()
+        self.db_progress_glyph.set_text("●")
+        glyph_ctx.add_class("dim-label")
+        lbl_ctx.add_class("dim-label")
+        self.db_progress_glyph.show()
+        self.db_progress_label.set_text("Bereit — keine aktive Datenbankabfrage")
+        self.db_progress_bar.set_fraction(0.0)
+        self.db_progress_pct_label.set_text("Bereit")
+        self.db_progress_bar.queue_draw()
+
     def _set_hits_search_running_ui(
         self,
         running: bool,
@@ -8474,14 +8907,18 @@ class MintRipWindow(Gtk.ApplicationWindow):
     ) -> bool:
         self._hits_search_active = bool(running)
         if self._hits_search_active:
+            title_txt = title or "CD wird eingelesen & Alben werden abgefragt…"
+            sub_txt = subtitle or "MusicBrainz · Discogs · CDDB / GnuDB"
             if hasattr(self, "hits_overlay_title_label"):
-                title_txt = title or "CD wird eingelesen & Alben werden abgefragt…"
                 self.hits_overlay_title_label.set_markup(f"<b>{GLib.markup_escape_text(title_txt)}</b>")
             if hasattr(self, "hits_overlay_sub_label"):
-                sub_txt = subtitle or "MusicBrainz · Discogs · CDDB / GnuDB"
                 self.hits_overlay_sub_label.set_markup(
                     f"<span size='small'>{GLib.markup_escape_text(sub_txt)}</span>"
                 )
+            self._db_progress_start("hits", f"{title_txt} ({sub_txt})")
+        else:
+            if "hits" in self._db_progress_tasks:
+                self._db_progress_finish("hits", "Datenbankabfrage abgeschlossen")
         if hasattr(self, "hits_search_overlay_box"):
             self.hits_search_overlay_box.set_no_show_all(not self._hits_search_active)
             if self._hits_search_active:
@@ -8572,6 +9009,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
         if self._cover_search_cancel_event is not None:
             self._cover_search_cancel_event.set()
             self._cover_search_cancel_event = None
+        self._db_progress_finish("cover", "Cover-Suche abgebrochen", cancelled=True)
         self._set_cover_search_running_ui(False)
         self._append_query_log_ui(
             "[Cover-Suche] Online-Cover-Suche vom Benutzer abgebrochen."
@@ -8625,11 +9063,16 @@ class MintRipWindow(Gtk.ApplicationWindow):
         title = self.album.title
         q = (custom_query or (self.search_entry.get_text() if is_cover_only else "") or "").strip()
         label_target = q or f"{artist} – {title}"
+        self._db_progress_start(
+            "cover",
+            f"Cover-Suche läuft ({len(enabled_providers)} Bilddatenbanken) für „{label_target}“…",
+        )
         self._append_query_log_ui(
             f"[Cover-Suche] Starte Vollabfrage über {len(enabled_providers)} aktivierte Quellen ({' · '.join(provider_labels)}) für „{label_target}“..."
         )
 
         def worker() -> None:
+            found_count = 0
             try:
                 candidates = search_all_cover_candidates(
                     artist=artist,
@@ -8647,6 +9090,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 )
                 if cancel_evt.is_set():
                     return
+                found_count = len(candidates or [])
                 if not candidates:
                     self._append_query_log_threadsafe(
                         "[Cover-Suche] Kein Cover bei den aktivierten Bilddatenbanken gefunden."
@@ -8662,6 +9106,18 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 def _finish() -> bool:
                     if self._cover_search_cancel_event is cancel_evt:
                         self._cover_search_cancel_event = None
+                        if cancel_evt.is_set():
+                            self._db_progress_finish("cover", "Cover-Suche abgebrochen", cancelled=True)
+                        elif found_count > 0:
+                            self._db_progress_finish(
+                                "cover",
+                                f"Cover-Suche abgeschlossen: {found_count} Treffer gefunden",
+                            )
+                        else:
+                            self._db_progress_finish(
+                                "cover",
+                                "Cover-Suche abgeschlossen: Keine Treffer gefunden",
+                            )
                         self._set_cover_search_running_ui(False)
                     return False
 
@@ -9910,7 +10366,132 @@ class MintRipWindow(Gtk.ApplicationWindow):
             f"[Cover] Bild per Drag & Drop übernommen: {source_label} ({w}×{h} px · {len(image_bytes) // 1024} KB · Format: {orig_fmt})."
         )
 
+    def _on_draw_dnd_icon(self, area: Gtk.DrawingArea, cr) -> bool:
+        """Zeichnet ein klares Drag-&-Drop-Icon (Album-Ordner mit Ablege-Pfeil in Mintgrün)."""
+        w = area.get_allocated_width()
+        h = area.get_allocated_height()
+        s = min(w, h)
+        ox = (w - s) / 2.0
+        oy = (h - s) / 2.0
+        cr.save()
+        cr.translate(ox, oy)
+        cr.scale(s / 48.0, s / 48.0)
+
+        # Leichter Hintergrund-Kreis
+        cr.set_source_rgba(0.357, 0.651, 0.196, 0.14)
+        cr.arc(24.0, 24.0, 22.0, 0, 2.0 * math.pi)
+        cr.fill()
+
+        # Ablage-Schale / Ordner-Umriss
+        cr.set_source_rgba(0.357, 0.651, 0.196, 0.95)
+        cr.set_line_width(2.6)
+        cr.set_line_cap(1)   # CAIRO_LINE_CAP_ROUND
+        cr.set_line_join(1)  # CAIRO_LINE_JOIN_ROUND
+
+        cr.move_to(11.0, 28.0)
+        cr.line_to(11.0, 34.0)
+        cr.curve_to(11.0, 36.2, 12.8, 38.0, 15.0, 38.0)
+        cr.line_to(33.0, 38.0)
+        cr.curve_to(35.2, 38.0, 37.0, 36.2, 37.0, 34.0)
+        cr.line_to(37.0, 28.0)
+        cr.stroke()
+
+        # Nach-unten-Pfeil (Drag & Drop)
+        cr.move_to(24.0, 11.0)
+        cr.line_to(24.0, 29.0)
+        cr.stroke()
+        cr.move_to(17.5, 23.0)
+        cr.line_to(24.0, 29.5)
+        cr.line_to(30.5, 23.0)
+        cr.stroke()
+        cr.restore()
+        return False
+
+    def _build_dnd_overlay_box(self, title_markup: str, subtitle_markup: str) -> Gtk.Box:
+        """Erstellt das leichte halbtransparente Drag-&-Drop-Overlay mit Icon über Alben- & Titelliste."""
+        overlay_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        overlay_box.get_style_context().add_class("dnd-drop-overlay")
+        overlay_box.set_halign(Gtk.Align.FILL)
+        overlay_box.set_valign(Gtk.Align.FILL)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        card.get_style_context().add_class("dnd-drop-overlay-card")
+        card.set_halign(Gtk.Align.CENTER)
+        card.set_valign(Gtk.Align.CENTER)
+
+        icon_area = Gtk.DrawingArea()
+        icon_area.set_size_request(52, 52)
+        icon_area.set_halign(Gtk.Align.CENTER)
+        icon_area.connect("draw", self._on_draw_dnd_icon)
+        card.pack_start(icon_area, False, False, 0)
+
+        lbl_title = Gtk.Label()
+        lbl_title.set_markup(f"<b>{title_markup}</b>")
+        lbl_title.set_halign(Gtk.Align.CENTER)
+        card.pack_start(lbl_title, False, False, 0)
+
+        lbl_sub = Gtk.Label()
+        lbl_sub.set_markup(f"<span size='small'>{subtitle_markup}</span>")
+        lbl_sub.get_style_context().add_class("dim-label")
+        lbl_sub.set_halign(Gtk.Align.CENTER)
+        card.pack_start(lbl_sub, False, False, 0)
+
+        card.show_all()
+        overlay_box.pack_start(card, True, False, 0)
+        overlay_box.set_no_show_all(True)
+        overlay_box.hide()
+        return overlay_box
+
+    def _set_module3_dnd_overlay(self, target: str, active: bool) -> None:
+        """Zeigt/versteckt das leichte Drag-&-Drop-Overlay in Modul 3 flimmerfrei über Alben- oder Titelliste."""
+        timers = getattr(self, "_dnd_hide_timers", None)
+        if timers is None:
+            self._dnd_hide_timers = {}
+            timers = self._dnd_hide_timers
+        existing_tid = timers.pop(target, 0)
+        if existing_tid:
+            try:
+                GLib.source_remove(existing_tid)
+            except Exception:
+                pass
+
+        overlay_box = self.hits_dnd_overlay_box if target == "hits" else self.track_dnd_overlay_box
+        if active:
+            if getattr(self, "_active_module", "") != "module_tag":
+                overlay_box.hide()
+                return
+            if self._batch_running and not self._batch_paused:
+                overlay_box.hide()
+                return
+            if target == "hits" and self._hits_search_active:
+                overlay_box.hide()
+                return
+            overlay_box.show()
+            return
+
+        def _do_hide() -> bool:
+            timers.pop(target, None)
+            overlay_box.hide()
+            return False
+
+        timers[target] = GLib.timeout_add(65, _do_hide)
+
+    def _hide_all_module3_dnd_overlays(self) -> None:
+        timers = getattr(self, "_dnd_hide_timers", {})
+        for key in list(timers.keys()):
+            tid = timers.pop(key, 0)
+            if tid:
+                try:
+                    GLib.source_remove(tid)
+                except Exception:
+                    pass
+        if hasattr(self, "hits_dnd_overlay_box"):
+            self.hits_dnd_overlay_box.hide()
+        if hasattr(self, "track_dnd_overlay_box"):
+            self.track_dnd_overlay_box.hide()
+
     def _on_hits_audio_files_dropped(self, paths: list[Path]) -> None:
+        self._hide_all_module3_dnd_overlays()
         if getattr(self, "_active_module", "") != "module_tag":
             return
         if self._hits_search_active or (self._batch_running and not self._batch_paused):
@@ -9927,11 +10508,22 @@ class MintRipWindow(Gtk.ApplicationWindow):
         )
 
     def _on_audio_files_dropped(self, paths: list[Path]) -> None:
+        self._hide_all_module3_dnd_overlays()
         if self._batch_running and not self._batch_paused:
             return
         if not paths:
             return
-        # Ordner-Drop in Titel- & Metadaten-Verwaltung lädt direkt ohne automatische Online-Abfrage
+        if getattr(self, "_active_module", "") == "module_tag":
+            # Modul 3: Aktuell geladene Liste beim Drag & Drop eines Albums immer vollständig leeren
+            self._reset_all_fields_state(
+                emit_log=True,
+                log_reason="Drag & Drop in Titelliste – aktuelle Liste geleert, lade neues Album.",
+            )
+            self._import_audio_paths_with_toc(
+                paths, append=False, auto_online_lookup=False
+            )
+            return
+        # Modul 2: Ordner-Drop ersetzt, Einzeldatei-Drop hängt an
         is_folder_drop = any(p.is_dir() for p in paths)
         self._import_audio_paths_with_toc(
             paths, append=(not is_folder_drop), auto_online_lookup=False

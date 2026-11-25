@@ -222,6 +222,24 @@ box.cover-loading-overlay,
     border-radius: 6px;
 }
 
+/* Modul 3: Leichtes Drag-&-Drop-Overlay über Alben- und Titelliste */
+box.dnd-drop-overlay,
+.dnd-drop-overlay {
+    background-color: alpha(#5ba632, 0.14);
+    background-image: none;
+    border: 2px dashed alpha(#5ba632, 0.78);
+    border-radius: 6px;
+}
+
+box.dnd-drop-overlay-card,
+.dnd-drop-overlay-card {
+    background-color: alpha(@theme_base_color, 0.92);
+    border: 1px solid alpha(#5ba632, 0.45);
+    border-radius: 10px;
+    padding: 16px 24px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
 /* Modul 5: Zeilen- & Auswahl-Styling */
 .repair-file-row {
     border-bottom: 1px solid alpha(@theme_fg_color, 0.08);
@@ -248,6 +266,69 @@ box.cover-loading-overlay,
     box-shadow: none;
     padding: 0px;
     margin: 0px;
+}
+
+/* Fortschrittsleiste am unteren Fensterrand für alle Datenbankabfragen */
+box.db-query-progress-strip {
+    background-color: shade(@theme_bg_color, 0.94);
+    border-top: 1px solid alpha(@theme_fg_color, 0.18);
+    padding: 5px 12px;
+    min-height: 30px;
+}
+
+box.db-query-progress-strip.db-progress-active {
+    background-color: alpha(#5ba632, 0.08);
+    border-top: 1px solid alpha(#5ba632, 0.45);
+}
+
+box.db-query-progress-strip.db-progress-done {
+    background-color: alpha(#5ba632, 0.14);
+    border-top: 1px solid alpha(#5ba632, 0.58);
+}
+
+box.db-query-progress-strip.db-progress-cancelled {
+    background-color: alpha(#d97706, 0.11);
+    border-top: 1px solid alpha(#d97706, 0.48);
+}
+
+progressbar.db-query-progress-bar,
+progressbar.db-query-progress-bar > trough,
+progressbar.db-query-progress-bar trough {
+    min-height: 12px;
+    border-radius: 6px;
+    background-color: alpha(@theme_fg_color, 0.14);
+    background-image: none;
+    border: 1px solid alpha(@theme_fg_color, 0.14);
+    box-shadow: none;
+}
+
+progressbar.db-query-progress-bar > trough > progress,
+progressbar.db-query-progress-bar progress {
+    min-height: 12px;
+    border-radius: 5px;
+    background-color: #5ba632;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+}
+
+box.db-query-progress-strip.db-progress-cancelled progressbar.db-query-progress-bar > trough > progress,
+box.db-query-progress-strip.db-progress-cancelled progressbar.db-query-progress-bar progress {
+    background-color: #d97706;
+}
+
+label.db-progress-status-active {
+    font-weight: 600;
+}
+
+label.db-progress-status-done {
+    color: #3f7e1f;
+    font-weight: 700;
+}
+
+label.db-progress-status-cancelled {
+    color: #b45309;
+    font-weight: 700;
 }
 """.encode("utf-8")
 

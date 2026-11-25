@@ -27,9 +27,12 @@ import musicbrainzngs
 from .models import (
     COVER_PROVIDER_OPTIONS,
     DEFAULT_COVER_PROVIDERS,
+    DEFAULT_MB_LOCAL_HOST,
+    DEFAULT_MB_LOCAL_PORT,
     DEFAULT_MUSICBRAINZ_SERVER_URL,
     AlbumMetadata,
     TrackMetadata,
+    build_musicbrainz_server_url,
     normalize_cover_providers,
     normalize_multi_artist,
     normalize_musicbrainz_server_url,
@@ -77,9 +80,22 @@ def _get_configured_mb_base_url(explicit_url: str = "") -> str:
     if env_url:
         return normalize_musicbrainz_server_url(env_url)
     cfg = _read_settings_json_dict()
+    if "mb_use_local_mirror" in cfg:
+        return build_musicbrainz_server_url(
+            bool(cfg.get("mb_use_local_mirror", False)),
+            cfg.get("mb_local_host", DEFAULT_MB_LOCAL_HOST),
+            cfg.get("mb_local_port", DEFAULT_MB_LOCAL_PORT),
+        )
     if cfg.get("musicbrainz_server_url"):
         return normalize_musicbrainz_server_url(cfg["musicbrainz_server_url"])
     return DEFAULT_MUSICBRAINZ_SERVER_URL
+
+
+def _is_mb_fallback_to_official_enabled() -> bool:
+    cfg = _read_settings_json_dict()
+    if "mb_fallback_to_official" in cfg:
+        return bool(cfg["mb_fallback_to_official"])
+    return True
 
 
 def _get_configured_lastfm_api_key(explicit_key: str = "") -> str:
@@ -895,6 +911,17 @@ _MB_COOLDOWN_UNTIL = 0.0
 _MB_MIN_INTERVAL_SEC = 1.18
 _MB_CONSECUTIVE_503 = 0
 _MB_CIRCUIT_OPEN_UNTIL = 0.0
+_MB_MIRROR_UNREACHABLE_UNTIL = 0.0
+_MB_MIRROR_UNREACHABLE_URL = ""
+# (base_url, entity) -> (is_empty_bool, expires_mono)
+_MB_MIRROR_SOLR_STATUS: dict[tuple[str, str], tuple[bool, float]] = {}
+
+_MB_SOLR_SEARCH_ENTITIES: dict[str, tuple[str, str]] = {
+    "recording": ("recording/?query=Yesterday&limit=1&fmt=json", "recordings"),
+    "release": ("release/?query=Nevermind&limit=1&fmt=json", "releases"),
+    "release-group": ("release-group/?query=Nevermind&limit=1&fmt=json", "release-groups"),
+    "artist": ("artist/?query=Nirvana&limit=1&fmt=json", "artists"),
+}
 
 
 def _is_official_musicbrainz_host(url_str: str) -> bool:
@@ -1087,6 +1114,112 @@ def _urlopen_with_backoff(
     return b""
 
 
+def reset_musicbrainz_mirror_cooldown() -> None:
+    """Setzt die vorübergehende Ausweich-Sperre und Solr-Prüfcache für einen lokalen Mirror sofort zurück."""
+    global _MB_MIRROR_UNREACHABLE_UNTIL, _MB_MIRROR_UNREACHABLE_URL
+    with _MB_RATE_LOCK:
+        _MB_MIRROR_UNREACHABLE_UNTIL = 0.0
+        _MB_MIRROR_UNREACHABLE_URL = ""
+        _MB_MIRROR_SOLR_STATUS.clear()
+
+
+def _detect_mb_search_entity(clean_path: str) -> Optional[str]:
+    lower = clean_path.lower()
+    for ent in _MB_SOLR_SEARCH_ENTITIES:
+        if lower.startswith(f"{ent}/?"):
+            return ent
+    return None
+
+
+def _is_empty_mb_search_payload(entity: str, payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    list_key = _MB_SOLR_SEARCH_ENTITIES[entity][1]
+    items = payload.get(list_key)
+    count = payload.get("count")
+    return isinstance(items, list) and len(items) == 0 and (count is None or int(count or 0) == 0)
+
+
+def _probe_local_mirror_solr_entity(base_url: str, entity: str, timeout: float = 3.0) -> bool:
+    """Prüft, ob der lokale Solr-Suchindex für `entity` befüllt ist (True = Treffer vorhanden, False = leer/Fehler)."""
+    probe_path, list_key = _MB_SOLR_SEARCH_ENTITIES[entity]
+    probe_url = f"{base_url}/{probe_path}"
+    req = urllib.request.Request(
+        probe_url,
+        headers={
+            "User-Agent": USER_AGENT_HEADER,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            parsed = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if isinstance(parsed, dict):
+            items = parsed.get(list_key)
+            if isinstance(items, list) and len(items) > 0:
+                return True
+            if int(parsed.get("count") or 0) > 0:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def test_musicbrainz_connection(server_url: str, timeout: float = 4.0) -> tuple[bool, int, str]:
+    """Prüft Datenbank (PostgreSQL) und bei lokalem Mirror zusätzlich die Solr-Suchindizes (Release & Recording)."""
+    base_url = normalize_musicbrainz_server_url(server_url)
+    probe_url = f"{base_url}/artist/5b11f4ce-a62d-471e-81fc-a69a8278c7da?fmt=json"
+    req = urllib.request.Request(
+        probe_url,
+        headers={
+            "User-Agent": USER_AGENT_HEADER,
+            "Accept": "application/json",
+        },
+    )
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            body = resp.read().decode("utf-8", errors="replace")
+            elapsed_ms = max(1, int(round((time.monotonic() - t0) * 1000)))
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("id"):
+                if not _is_official_musicbrainz_host(base_url):
+                    reset_musicbrainz_mirror_cooldown()
+                    rel_ok = _probe_local_mirror_solr_entity(base_url, "release", timeout=min(timeout, 3.0))
+                    rec_ok = _probe_local_mirror_solr_entity(base_url, "recording", timeout=min(timeout, 3.0))
+                    now_mono = time.monotonic()
+                    with _MB_RATE_LOCK:
+                        _MB_MIRROR_SOLR_STATUS[(base_url, "release")] = (not rel_ok, now_mono + 600.0)
+                        _MB_MIRROR_SOLR_STATUS[(base_url, "recording")] = (not rec_ok, now_mono + 600.0)
+                    if rel_ok and rec_ok:
+                        return (
+                            True,
+                            elapsed_ms,
+                            f"Datenbank OK ({elapsed_ms} ms) · Solr-Suchindex (Release & Recording) aktiv – kein Rate-Limit",
+                        )
+                    empty_parts = []
+                    if not rel_ok:
+                        empty_parts.append("Release")
+                    if not rec_ok:
+                        empty_parts.append("Recording")
+                    empty_label = " & ".join(empty_parts)
+                    return (
+                        True,
+                        elapsed_ms,
+                        f"Datenbank OK ({elapsed_ms} ms) · ⚠ Solr-Suchindex ({empty_label}) leer – Freitextsuchen weichen automatisch auf musicbrainz.org aus, Detail-/ISRC-/MBID-Abrufe laufen lokal",
+                    )
+                return True, elapsed_ms, f"Verbunden mit musicbrainz.org ({elapsed_ms} ms)"
+            return False, elapsed_ms, f"Unerwartete Antwort (HTTP {status}) von {base_url}"
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = max(1, int(round((time.monotonic() - t0) * 1000)))
+        return False, elapsed_ms, f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        elapsed_ms = max(1, int(round((time.monotonic() - t0) * 1000)))
+        reason = getattr(exc, "reason", None) or str(exc)
+        return False, elapsed_ms, f"Nicht erreichbar ({reason})"
+
+
 def _mb_ws2_get_json(
     path: str,
     on_log: Optional[Callable[[str], None]] = None,
@@ -1098,15 +1231,19 @@ def _mb_ws2_get_json(
     mb_server_url: str = "",
     wait_on_circuit: bool = False,
 ) -> dict:
-    base_url = _get_configured_mb_base_url(mb_server_url)
+    global _MB_MIRROR_UNREACHABLE_UNTIL, _MB_MIRROR_UNREACHABLE_URL
+    configured_base = _get_configured_mb_base_url(mb_server_url)
     clean_path = path.lstrip("/")
-    url = f"{base_url}/{clean_path}"
-    cache_key = f"mb:{url}"
+    search_entity = _detect_mb_search_entity(clean_path)
+    # Kanonischer Cache-Key, damit Cache-Treffer nahtlos zwischen lokalem Mirror und musicbrainz.org geteilt werden
+    cache_key = f"mb:{clean_path}"
 
     if use_cache:
         cached = _cache_get_json(cache_key)
         if isinstance(cached, dict):
-            return cached
+            # Keine veralteten leeren Suchantworten aus dem Cache erzwingen, falls lokal gesucht wird
+            if not (search_entity and _is_empty_mb_search_payload(search_entity, cached)):
+                return cached
 
     if ttl_sec is None:
         if clean_path.startswith(("release/?", "recording/?", "release-group/?", "artist/?")):
@@ -1116,27 +1253,104 @@ def _mb_ws2_get_json(
         else:
             ttl_sec = 86400 * 30
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": f"{USER_AGENT_APP}/{USER_AGENT_VERSION} ({USER_AGENT_CONTACT})",
-            "Accept": "application/json",
-            "Connection": "keep-alive",
-        },
-    )
-    raw = _urlopen_with_backoff(
-        req,
-        timeout=timeout,
-        max_retries=max_retries,
-        on_log=on_log,
-        label="MusicBrainz",
-        cancel_event=cancel_event,
-        wait_on_circuit=wait_on_circuit,
-    )
-    parsed = json.loads(raw.decode("utf-8", errors="replace"))
-    if use_cache and isinstance(parsed, dict):
-        _cache_set_json(cache_key, parsed, ttl_sec=ttl_sec)
-    return parsed
+    is_local_mirror = not _is_official_musicbrainz_host(configured_base)
+    fallback_enabled = _is_mb_fallback_to_official_enabled()
+
+    def _do_request(target_base: str, req_timeout: int, req_retries: int, allow_cache_empty: bool = True) -> dict:
+        url = f"{target_base}/{clean_path}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT_HEADER,
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+            },
+        )
+        raw = _urlopen_with_backoff(
+            req,
+            timeout=req_timeout,
+            max_retries=req_retries,
+            on_log=on_log,
+            label="MusicBrainz",
+            cancel_event=cancel_event,
+            wait_on_circuit=wait_on_circuit,
+        )
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        if use_cache and isinstance(parsed, dict):
+            if allow_cache_empty or not (search_entity and _is_empty_mb_search_payload(search_entity, parsed)):
+                _cache_set_json(cache_key, parsed, ttl_sec=ttl_sec)
+        return parsed
+
+    if is_local_mirror and fallback_enabled:
+        now_mono = time.monotonic()
+        with _MB_RATE_LOCK:
+            mirror_in_cooldown = (
+                _MB_MIRROR_UNREACHABLE_URL == configured_base and now_mono < _MB_MIRROR_UNREACHABLE_UNTIL
+            )
+            solr_cached = _MB_MIRROR_SOLR_STATUS.get((configured_base, search_entity)) if search_entity else None
+        if mirror_in_cooldown:
+            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+        if search_entity and solr_cached is not None and now_mono < solr_cached[1] and solr_cached[0]:
+            # Bekanntermaßen leerer lokaler Solr-Core -> Freitextsuche direkt an musicbrainz.org senden
+            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+        try:
+            # Schneller Timeout & kein Retry auf lokalem Mirror, damit bei gestopptem Docker-Container sofort ausgewichen wird
+            local_res = _do_request(
+                configured_base,
+                min(timeout, 4),
+                0,
+                allow_cache_empty=False,
+            )
+            if search_entity and _is_empty_mb_search_payload(search_entity, local_res):
+                known_populated = solr_cached is not None and now_mono < solr_cached[1] and not solr_cached[0]
+                if not known_populated:
+                    has_solr_data = _probe_local_mirror_solr_entity(configured_base, search_entity, timeout=2.5)
+                    with _MB_RATE_LOCK:
+                        _MB_MIRROR_SOLR_STATUS[(configured_base, search_entity)] = (
+                            not has_solr_data,
+                            time.monotonic() + 600.0,
+                        )
+                    if not has_solr_data:
+                        _log_step(
+                            f"[MusicBrainz] Lokaler Mirror ({configured_base}): Solr-Suchindex für „{search_entity}“ ist leer – "
+                            f"weiche für {search_entity}-Freitextsuchen automatisch auf musicbrainz.org aus (Direktabrufe per MBID/ISRC/DiscID laufen weiter lokal).",
+                            on_log,
+                        )
+                        return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+            return local_res
+        except InterruptedError:
+            raise
+        except urllib.error.HTTPError as http_exc:
+            if http_exc.code not in (500, 502, 503, 504):
+                raise
+            with _MB_RATE_LOCK:
+                _MB_MIRROR_UNREACHABLE_URL = configured_base
+                _MB_MIRROR_UNREACHABLE_UNTIL = time.monotonic() + 30.0
+            _log_step(
+                f"[MusicBrainz] Lokaler Mirror ({configured_base}) meldete HTTP {http_exc.code} – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.",
+                on_log,
+            )
+            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            http.client.HTTPException,
+            ConnectionError,
+            OSError,
+            json.JSONDecodeError,
+        ) as mirror_exc:
+            with _MB_RATE_LOCK:
+                _MB_MIRROR_UNREACHABLE_URL = configured_base
+                _MB_MIRROR_UNREACHABLE_UNTIL = time.monotonic() + 30.0
+            reason = getattr(mirror_exc, "reason", None) or str(mirror_exc)
+            _log_step(
+                f"[MusicBrainz] Lokaler Mirror ({configured_base}) nicht erreichbar ({reason}) – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.",
+                on_log,
+            )
+            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+
+    return _do_request(configured_base, timeout, max_retries, allow_cache_empty=not is_local_mirror)
 
 
 def _preserve_physical_toc(target: AlbumMetadata, physical: AlbumMetadata) -> AlbumMetadata:
@@ -3628,15 +3842,12 @@ def search_all_cover_candidates(
         ):
             if clean_mbid and _UUID_RE.match(clean_mbid):
                 try:
-                    req = urllib.request.Request(
-                        f"{MB_WS2_BASE}/release/{urllib.parse.quote(clean_mbid)}?inc=release-groups&fmt=json",
-                        headers={
-                            "User-Agent": f"{USER_AGENT_APP}/{USER_AGENT_VERSION} ({USER_AGENT_CONTACT})",
-                            "Accept": "application/json",
-                        },
+                    rdata = _mb_ws2_get_json(
+                        f"release/{urllib.parse.quote(clean_mbid)}?inc=release-groups&fmt=json",
+                        cancel_event=cancel_event,
+                        timeout=6,
+                        max_retries=1,
                     )
-                    with urllib.request.urlopen(req, timeout=6) as resp:
-                        rdata = json.loads(resp.read().decode("utf-8", errors="replace"))
                     rg_obj = rdata.get("release-group") or {}
                     rg_val = str(rg_obj.get("id") or "").strip()
                     if rg_val and _UUID_RE.match(rg_val):
@@ -3656,15 +3867,12 @@ def search_all_cover_candidates(
                     if eff_title:
                         rg_q_parts.append(f'releasegroup:"{eff_title}"')
                     rg_q = " AND ".join(rg_q_parts) if rg_q_parts else search_term
-                    req = urllib.request.Request(
-                        f"{MB_WS2_BASE}/release-group/?query={urllib.parse.quote(rg_q)}&limit=4&fmt=json",
-                        headers={
-                            "User-Agent": f"{USER_AGENT_APP}/{USER_AGENT_VERSION} ({USER_AGENT_CONTACT})",
-                            "Accept": "application/json",
-                        },
+                    rg_res = _mb_ws2_get_json(
+                        f"release-group/?query={urllib.parse.quote(rg_q)}&limit=4&fmt=json",
+                        cancel_event=cancel_event,
+                        timeout=6,
+                        max_retries=1,
                     )
-                    with urllib.request.urlopen(req, timeout=6) as resp:
-                        rg_res = json.loads(resp.read().decode("utf-8", errors="replace"))
                     for rg_item in (rg_res.get("release-groups") or [])[:4]:
                         rg_val = str(rg_item.get("id") or "").strip()
                         if rg_val and _UUID_RE.match(rg_val) and rg_val not in mb_rg_ids:
@@ -6146,10 +6354,50 @@ def analyze_single_track_musicbrainz(
 
     best_rec: Optional[dict] = None
     match_method = "MusicBrainz (Einzeltrack)"
+    need_deep_rels = _get_configured_bool_setting("mb_load_deep_relations", False)
 
-    # Stufe 1: Exakter ISRC-Treffer (falls vorhanden)
+    # Stufe 0: Direkter Recording-MBID-Abruf (funktioniert lokal direkt über PostgreSQL — ganz ohne Solr-Suchindex!)
+    mbid_matched = False
+    existing_rec_id = str(getattr(track, "musicbrainz_recording_id", "") or "").strip()
+    if existing_rec_id and _UUID_RE.match(existing_rec_id):
+        _log_step(
+            f"[MusicBrainz Einzeltrack {trk_label}] Direktabruf per Recording-MBID {existing_rec_id[:8]}… (ohne Suchindex)...",
+            on_log,
+        )
+        try:
+            inc_str = (
+                "artists+genres+tags+releases+release-groups+work-rels"
+                if need_deep_rels
+                else "artists+genres+tags+releases+release-groups"
+            )
+            fetched_mbid = _mb_ws2_get_json(
+                f"recording/{urllib.parse.quote(existing_rec_id)}?inc={inc_str}&fmt=json",
+                on_log=on_log,
+                cancel_event=cancel_event,
+                timeout=18,
+                max_retries=2,
+                wait_on_circuit=True,
+            )
+            if isinstance(fetched_mbid, dict) and fetched_mbid.get("id"):
+                best_rec = fetched_mbid
+                mbid_matched = True
+                match_method = "MusicBrainz (Recording-MBID)"
+        except InterruptedError:
+            raise
+        except urllib.error.HTTPError as http_exc:
+            if http_exc.code in (503, 429):
+                _log_step(
+                    f"[MusicBrainz Einzeltrack {trk_label}] MusicBrainz vorübergehend überlastet (HTTP {http_exc.code}) – überspringe Fallback-Suche für diesen Titel.",
+                    on_log,
+                )
+                return None
+            best_rec = None
+        except Exception:
+            best_rec = None
+
+    # Stufe 1: Exakter ISRC-Treffer (falls vorhanden & noch kein MBID-Treffer)
     isrc_matched = False
-    if isrc and re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}\d{7}", isrc):
+    if best_rec is None and isrc and re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}\d{7}", isrc):
         _log_step(
             f"[MusicBrainz Einzeltrack {trk_label}] Prüfe exakten ISRC {isrc}...",
             on_log,
@@ -6267,13 +6515,12 @@ def analyze_single_track_musicbrainz(
     rec_id = str(best_rec.get("id") or "").strip()
     detail_rec = best_rec
 
-    # Stufe 3: Recording-Details nur nachladen, falls Stufe 1 (ISRC) noch keine Genres/Artists/Releases geliefert hat oder tiefe Relationen aktiv sind
-    need_deep_rels = _get_configured_bool_setting("mb_load_deep_relations", False)
+    # Stufe 3: Recording-Details nur nachladen, falls noch nicht vollständig über MBID (Stufe 0) oder ISRC (Stufe 1) geladen
     has_isrc_details = isrc_matched and bool(
         best_rec.get("artist-credit")
         and (best_rec.get("genres") or best_rec.get("tags") or best_rec.get("releases"))
     )
-    if rec_id and _UUID_RE.match(rec_id) and (not has_isrc_details or need_deep_rels):
+    if rec_id and _UUID_RE.match(rec_id) and not mbid_matched and (not has_isrc_details or need_deep_rels):
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("Abfrage vom Benutzer abgebrochen.")
         try:

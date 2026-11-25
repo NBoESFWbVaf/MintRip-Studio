@@ -25,3 +25,59 @@
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
+
+@keyframes db-progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+.animate-db-progress-indeterminate {
+  animation: db-progress-indeterminate 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+progress.db-progress-native {
+  display: block;
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  overflow: hidden;
+  border-radius: 9999px;
+  background-color: rgba(100, 116, 139, 0.24);
+}
+
+progress.db-progress-native::-webkit-progress-bar {
+  background-color: rgba(100, 116, 139, 0.22);
+  border-radius: 9999px;
+}
+
+progress.db-progress-native::-webkit-progress-value {
+  background-color: #5ba632;
+  border-radius: 9999px;
+  transition: width 180ms ease-out;
+}
+
+progress.db-progress-native::-moz-progress-bar {
+  background-color: #5ba632;
+  border-radius: 9999px;
+}
+
+.dark progress.db-progress-native::-webkit-progress-value {
+  background-color: #69b53f;
+}
+
+.dark progress.db-progress-native::-moz-progress-bar {
+  background-color: #69b53f;
+}
+
+progress.db-progress-native.db-progress-cancelled::-webkit-progress-value {
+  background-color: #d97706;
+}
+
+progress.db-progress-native.db-progress-cancelled::-moz-progress-bar {
+  background-color: #d97706;
+}
+

@@ -5,6 +5,8 @@ import {
   DEFAULT_COVER_MAX_DIMENSION,
   DEFAULT_COVER_PROVIDERS,
   DEFAULT_MAX_THREADS,
+  DEFAULT_MB_LOCAL_HOST,
+  DEFAULT_MB_LOCAL_PORT,
   DEFAULT_MODULE_OUTPUT_DIRS,
   DEFAULT_MUSICBRAINZ_SERVER_URL,
   DEFAULT_VISIBLE_LEFT_TAG_FIELDS,
@@ -12,11 +14,15 @@ import {
   LeftTagFieldCategory,
   Mp3QualityMode,
   MUSICBRAINZ_LEFT_TAG_FIELDS,
+  buildMusicBrainzServerUrl,
   normalizeCoverMaxDimension,
   normalizeCoverProviders,
   normalizeMaxThreads,
+  normalizeMbLocalHost,
+  normalizeMbLocalPort,
   normalizeMusicBrainzServerUrl,
   normalizeShazamSampleSize,
+  parseMusicBrainzLocalHostPort,
   ParanoiaMode,
   SHAZAM_SAMPLE_SIZE_OPTIONS,
 } from '../types/mintrip';
@@ -135,8 +141,86 @@ function SettingsNotebookContent({
   const [showLastfmKey, setShowLastfmKey] = useState(false);
   const [cacheStats, setCacheStats] = useState<{ entries: number; sizeBytes: number } | null>(null);
   const [isClearingCache, setIsClearingCache] = useState(false);
+  const [isTestingMbConn, setIsTestingMbConn] = useState(false);
+  const [mbConnStatus, setMbConnStatus] = useState<{ ok: boolean; message: string; url: string } | null>(null);
   const templateInputRef = useRef<HTMLInputElement>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
+
+  const legacyMbParsed = parseMusicBrainzLocalHostPort(settings.musicbrainzServerUrl);
+  const mbUseLocalMirror =
+    typeof settings.mbUseLocalMirror === 'boolean'
+      ? settings.mbUseLocalMirror
+      : legacyMbParsed.useLocalMirror;
+  const mbLocalHost = settings.mbLocalHost ?? legacyMbParsed.host ?? DEFAULT_MB_LOCAL_HOST;
+  const mbLocalPort = settings.mbLocalPort ?? legacyMbParsed.port ?? DEFAULT_MB_LOCAL_PORT;
+  const mbFallbackToOfficial = settings.mbFallbackToOfficial !== false;
+  const effectiveMbServerUrl = buildMusicBrainzServerUrl(mbUseLocalMirror, mbLocalHost, mbLocalPort);
+
+  const updateMbMirrorSettings = (patch: {
+    useLocalMirror?: boolean;
+    host?: string;
+    port?: number;
+    fallbackToOfficial?: boolean;
+  }) => {
+    setMbConnStatus(null);
+    onSettingsChange((s) => {
+      const fallbackParsed = parseMusicBrainzLocalHostPort(s.musicbrainzServerUrl);
+      const nextUseLocal =
+        patch.useLocalMirror !== undefined
+          ? patch.useLocalMirror
+          : typeof s.mbUseLocalMirror === 'boolean'
+          ? s.mbUseLocalMirror
+          : fallbackParsed.useLocalMirror;
+      const nextHost =
+        patch.host !== undefined ? patch.host : s.mbLocalHost ?? fallbackParsed.host ?? DEFAULT_MB_LOCAL_HOST;
+      const nextPort =
+        patch.port !== undefined
+          ? patch.port
+          : s.mbLocalPort ?? fallbackParsed.port ?? DEFAULT_MB_LOCAL_PORT;
+      const nextFallback =
+        patch.fallbackToOfficial !== undefined
+          ? patch.fallbackToOfficial
+          : s.mbFallbackToOfficial !== false;
+      return {
+        ...s,
+        mbUseLocalMirror: nextUseLocal,
+        mbLocalHost: nextHost,
+        mbLocalPort: nextPort,
+        mbFallbackToOfficial: nextFallback,
+        musicbrainzServerUrl: buildMusicBrainzServerUrl(nextUseLocal, nextHost, nextPort),
+      };
+    });
+  };
+
+  const handleTestMbConnection = async () => {
+    setIsTestingMbConn(true);
+    setMbConnStatus(null);
+    try {
+      const resp = await fetch('/api/musicbrainz/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          useLocalMirror: mbUseLocalMirror,
+          host: normalizeMbLocalHost(mbLocalHost),
+          port: normalizeMbLocalPort(mbLocalPort),
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      setMbConnStatus({
+        ok: Boolean(data.ok),
+        message: String(data.message || (resp.ok ? 'Verbunden' : `Fehler (HTTP ${resp.status})`)),
+        url: String(data.url || effectiveMbServerUrl),
+      });
+    } catch (err) {
+      setMbConnStatus({
+        ok: false,
+        message: `Verbindungstest fehlgeschlagen (${err instanceof Error ? err.message : String(err)})`,
+        url: effectiveMbServerUrl,
+      });
+    } finally {
+      setIsTestingMbConn(false);
+    }
+  };
 
   useEffect(() => {
     if (activeTab !== 'drive_cover') return;
@@ -1305,29 +1389,121 @@ function SettingsNotebookContent({
                   </div>
                 </label>
 
-                <label className="block space-y-1 pt-1">
-                  <span className="text-[#57606A] dark:text-[#8B949E]">
-                    MusicBrainz-Server-URL (Standard oder eigener lokaler Docker-Mirror ohne Rate-Limit)
-                  </span>
-                  <input
-                    type="text"
-                    value={settings.musicbrainzServerUrl ?? DEFAULT_MUSICBRAINZ_SERVER_URL}
-                    onChange={(e) =>
-                      onSettingsChange((s) => ({ ...s, musicbrainzServerUrl: e.target.value }))
-                    }
-                    onBlur={(e) =>
-                      onSettingsChange((s) => ({
-                        ...s,
-                        musicbrainzServerUrl: normalizeMusicBrainzServerUrl(e.target.value),
-                      }))
-                    }
-                    placeholder="https://musicbrainz.org/ws/2 oder http://localhost:5000/ws/2"
-                    className="w-full px-2 py-1 font-mono text-xs rounded border border-[#D0D7DE] dark:border-[#444C56] bg-[#F8F9FA] dark:bg-[#1C1F23] text-[#1F2328] dark:text-[#EAEEF2] focus:outline-none focus:ring-2 focus:ring-[#5BA632]"
-                  />
-                  <span className="block text-[11px] text-[#57606A] dark:text-[#8B949E]">
-                    Bei einem lokalen Mirror (z. B. <span className="font-mono">http://localhost:5000/ws/2</span>) wird die 1-Anfrage/Sekunde-Drosselung automatisch abgeschaltet.
-                  </span>
-                </label>
+                <div className="space-y-2 pt-1 rounded border border-[#D0D7DE] dark:border-[#444C56] bg-[#F8F9FA]/70 dark:bg-[#1C1F23]/60 p-2.5">
+                  <label className="flex items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={mbUseLocalMirror}
+                      onChange={(e) => updateMbMirrorSettings({ useLocalMirror: e.target.checked })}
+                      className="accent-[#5BA632] mt-0.5"
+                    />
+                    <span>
+                      <span className="block font-medium text-[#1F2328] dark:text-[#EAEEF2]">
+                        Lokalen MusicBrainz-Docker-Container verwenden (ohne 1-Anfrage/Sekunde-Limit)
+                      </span>
+                      <span className="block text-[11px] text-[#57606A] dark:text-[#8B949E]">
+                        Aktiviert deinen lokalen MusicBrainz-Mirror als primäre Quelle. Deaktiviert = direkt offizielle Server (<span className="font-mono">musicbrainz.org</span>).
+                      </span>
+                    </span>
+                  </label>
+
+                  <div className="pl-6 flex flex-wrap items-end gap-2">
+                    <label className="flex-1 min-w-[180px] space-y-1">
+                      <span className="block text-[11px] text-[#57606A] dark:text-[#8B949E]">
+                        Host / IP-Adresse (Docker-Container)
+                      </span>
+                      <input
+                        type="text"
+                        disabled={!mbUseLocalMirror}
+                        value={mbLocalHost}
+                        onChange={(e) => updateMbMirrorSettings({ host: e.target.value })}
+                        onBlur={(e) =>
+                          updateMbMirrorSettings({ host: normalizeMbLocalHost(e.target.value) })
+                        }
+                        placeholder="localhost oder 192.168.178.10"
+                        className="w-full px-2 py-1 font-mono text-xs rounded border border-[#D0D7DE] dark:border-[#444C56] bg-white dark:bg-[#16191D] text-[#1F2328] dark:text-[#EAEEF2] disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-[#5BA632]"
+                      />
+                    </label>
+
+                    <label className="w-28 space-y-1">
+                      <span className="block text-[11px] text-[#57606A] dark:text-[#8B949E]">
+                        Port
+                      </span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={65535}
+                        disabled={!mbUseLocalMirror}
+                        value={mbLocalPort}
+                        onChange={(e) => {
+                          const v = Number.parseInt(e.target.value, 10);
+                          if (Number.isFinite(v)) {
+                            updateMbMirrorSettings({ port: v });
+                          }
+                        }}
+                        onBlur={(e) =>
+                          updateMbMirrorSettings({ port: normalizeMbLocalPort(e.target.value) })
+                        }
+                        placeholder="5000"
+                        className="w-full px-2 py-1 font-mono text-xs rounded border border-[#D0D7DE] dark:border-[#444C56] bg-white dark:bg-[#16191D] text-[#1F2328] dark:text-[#EAEEF2] disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-[#5BA632]"
+                      />
+                    </label>
+
+                    <button
+                      type="button"
+                      disabled={isTestingMbConn}
+                      onClick={handleTestMbConnection}
+                      className="px-2.5 py-1 text-xs font-medium rounded border border-[#D0D7DE] dark:border-[#444C56] bg-white dark:bg-[#22272E] hover:bg-[#F3F4F6] dark:hover:bg-[#2D333B] text-[#1F2328] dark:text-[#EAEEF2] disabled:opacity-50 cursor-pointer"
+                    >
+                      {isTestingMbConn ? 'Prüfe…' : 'Verbindung testen'}
+                    </button>
+                  </div>
+
+                  <label className={`pl-6 flex items-start gap-2.5 ${mbUseLocalMirror ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}>
+                    <input
+                      type="checkbox"
+                      disabled={!mbUseLocalMirror}
+                      checked={mbFallbackToOfficial}
+                      onChange={(e) =>
+                        updateMbMirrorSettings({ fallbackToOfficial: e.target.checked })
+                      }
+                      className="accent-[#5BA632] mt-0.5"
+                    />
+                    <span className="text-[11px] text-[#57606A] dark:text-[#8B949E]">
+                      <span className="font-medium text-[#1F2328] dark:text-[#EAEEF2]">
+                        Bei Nichterreichbarkeit automatisch auf offizielle MusicBrainz-Server (musicbrainz.org) ausweichen
+                      </span>{' '}
+                      (kein Hänger, falls der Docker-Container gestoppt ist).
+                    </span>
+                  </label>
+
+                  <div className="pl-6 text-[11px]">
+                    {mbConnStatus ? (
+                      <span
+                        className={
+                          mbConnStatus.ok
+                            ? 'text-[#2E7D32] dark:text-[#6BCB57] font-medium'
+                            : 'text-[#C62828] dark:text-[#F87171] font-medium'
+                        }
+                      >
+                        {mbConnStatus.ok ? '✓' : '✗'} {mbConnStatus.message}{' '}
+                        <span className="font-mono font-normal opacity-80">({mbConnStatus.url})</span>
+                        {!mbConnStatus.ok && mbUseLocalMirror && mbFallbackToOfficial
+                          ? ' – Ausweichen auf musicbrainz.org ist aktiv.'
+                          : ''}
+                      </span>
+                    ) : (
+                      <span className="text-[#57606A] dark:text-[#8B949E]">
+                        Aktiver Endpunkt: <span className="font-mono">{effectiveMbServerUrl}</span>
+                        {mbUseLocalMirror
+                          ? mbFallbackToOfficial
+                            ? ' · automatischer Fallback auf musicbrainz.org aktiv'
+                            : ' · Fallback deaktiviert'
+                          : ' (offizielle MusicBrainz-Server)'}
+                      </span>
+                    )}
+                  </div>
+                </div>
 
                 <div className="space-y-1.5 pt-1">
                   <label className="flex items-start gap-2.5 cursor-pointer">

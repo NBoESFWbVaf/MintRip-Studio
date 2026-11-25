@@ -399,6 +399,92 @@ export const DEFAULT_MODULE_OUTPUT_DIRS = {
 } as const;
 
 export const DEFAULT_MUSICBRAINZ_SERVER_URL = 'https://musicbrainz.org/ws/2';
+export const DEFAULT_MB_LOCAL_HOST = 'localhost';
+export const DEFAULT_MB_LOCAL_PORT = 5000;
+
+export function normalizeMbLocalHost(raw: unknown): string {
+  let val = String(raw || '').trim();
+  if (!val) return DEFAULT_MB_LOCAL_HOST;
+  if (/\s/.test(val) || val.includes('@') || val.includes('?') || val.includes('#')) {
+    return DEFAULT_MB_LOCAL_HOST;
+  }
+  let scheme = '';
+  const lower = val.toLowerCase();
+  if (lower.startsWith('https://')) {
+    scheme = 'https://';
+    val = val.slice(8);
+  } else if (lower.startsWith('http://')) {
+    val = val.slice(7);
+  }
+  val = val.split('/', 1)[0].trim();
+  if (!val) return DEFAULT_MB_LOCAL_HOST;
+  if (val.startsWith('[')) {
+    const endIdx = val.indexOf(']');
+    if (endIdx > 0) val = val.slice(0, endIdx + 1);
+  } else if (val.includes(':')) {
+    const idx = val.lastIndexOf(':');
+    const hostPart = val.slice(0, idx);
+    const portPart = val.slice(idx + 1);
+    if (hostPart && /^\d+$/.test(portPart)) {
+      val = hostPart;
+    }
+  }
+  if (!val) return DEFAULT_MB_LOCAL_HOST;
+  return `${scheme}${val}`;
+}
+
+export function normalizeMbLocalPort(raw: unknown): number {
+  const parsed = Number.parseInt(String(raw ?? ''), 10);
+  if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535) {
+    return parsed;
+  }
+  return DEFAULT_MB_LOCAL_PORT;
+}
+
+export function buildMusicBrainzServerUrl(
+  useLocalMirror: boolean,
+  localHost: unknown = DEFAULT_MB_LOCAL_HOST,
+  localPort: unknown = DEFAULT_MB_LOCAL_PORT
+): string {
+  if (!useLocalMirror) return DEFAULT_MUSICBRAINZ_SERVER_URL;
+  const host = normalizeMbLocalHost(localHost);
+  const port = normalizeMbLocalPort(localPort);
+  if (host.toLowerCase().startsWith('https://')) {
+    return `https://${host.slice(8)}:${port}/ws/2`;
+  }
+  return `http://${host}:${port}/ws/2`;
+}
+
+export function parseMusicBrainzLocalHostPort(serverUrl: unknown): {
+  useLocalMirror: boolean;
+  host: string;
+  port: number;
+} {
+  const norm = normalizeMusicBrainzServerUrl(serverUrl);
+  if (norm === DEFAULT_MUSICBRAINZ_SERVER_URL) {
+    return { useLocalMirror: false, host: DEFAULT_MB_LOCAL_HOST, port: DEFAULT_MB_LOCAL_PORT };
+  }
+  try {
+    const parsed = new URL(norm);
+    const hostname = (parsed.hostname || '').trim();
+    if (!hostname || hostname.toLowerCase() === 'musicbrainz.org' || hostname.toLowerCase().endsWith('.musicbrainz.org')) {
+      return { useLocalMirror: false, host: DEFAULT_MB_LOCAL_HOST, port: DEFAULT_MB_LOCAL_PORT };
+    }
+    const hostDisplay = parsed.protocol === 'https:' ? `https://${hostname}` : hostname;
+    const port = parsed.port
+      ? normalizeMbLocalPort(parsed.port)
+      : parsed.protocol === 'https:'
+      ? 443
+      : DEFAULT_MB_LOCAL_PORT;
+    return {
+      useLocalMirror: true,
+      host: normalizeMbLocalHost(hostDisplay),
+      port,
+    };
+  } catch {
+    return { useLocalMirror: false, host: DEFAULT_MB_LOCAL_HOST, port: DEFAULT_MB_LOCAL_PORT };
+  }
+}
 
 export function normalizeMusicBrainzServerUrl(raw: unknown): string {
   const val = String(raw || '').trim().replace(/\/+$/, '');
@@ -441,6 +527,10 @@ export interface ExportSettings {
   discogsToken?: string;
   lastfmApiKey?: string;
   musicbrainzServerUrl?: string;
+  mbUseLocalMirror?: boolean;
+  mbLocalHost?: string;
+  mbLocalPort?: number;
+  mbFallbackToOfficial?: boolean;
   mbLoadDeepRelations?: boolean;
   preferSubgenres?: boolean;
   autoEnrichTrackGenres?: boolean;

@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { CheckCircle2, Loader2, Square } from 'lucide-react';
 import { BatchQueueView } from './components/BatchQueueView';
 import {
   ConverterToolbarState,
@@ -30,7 +31,11 @@ import {
   DEFAULT_COVER_PROVIDERS,
   DEFAULT_MAX_THREADS,
   DEFAULT_MODULE_OUTPUT_DIRS,
+  DEFAULT_MB_LOCAL_HOST,
+  DEFAULT_MB_LOCAL_PORT,
   DEFAULT_MUSICBRAINZ_SERVER_URL,
+  buildMusicBrainzServerUrl,
+  parseMusicBrainzLocalHostPort,
   DEFAULT_SHAZAM_SAMPLE_SIZE,
   DEFAULT_VISIBLE_LEFT_TAG_FIELDS,
   ExportSettings,
@@ -133,6 +138,10 @@ const INITIAL_SETTINGS: ExportSettings = {
   discogsToken: '',
   lastfmApiKey: '',
   musicbrainzServerUrl: DEFAULT_MUSICBRAINZ_SERVER_URL,
+  mbUseLocalMirror: false,
+  mbLocalHost: DEFAULT_MB_LOCAL_HOST,
+  mbLocalPort: DEFAULT_MB_LOCAL_PORT,
+  mbFallbackToOfficial: true,
   mbLoadDeepRelations: false,
   preferSubgenres: true,
   autoEnrichTrackGenres: true,
@@ -276,18 +285,154 @@ export default function App() {
   const [isAnalyzingMbTracks, setIsAnalyzingMbTracks] = useState(false);
   const [isEnrichingGenres, setIsEnrichingGenres] = useState(false);
 
+  // Dauerhafte Fortschrittsleiste am unteren Rand für alle Datenbankabfragen
+  const [dbProgressTasks, setDbProgressTasks] = useState<
+    Record<string, { label: string; current: number; total: number; seq: number }>
+  >({});
+  const dbProgressTasksRef = useRef<
+    Record<string, { label: string; current: number; total: number; seq: number }>
+  >({});
+  const [dbProgressNotice, setDbProgressNotice] = useState<{
+    summary: string;
+    cancelled: boolean;
+  } | null>(null);
+  const dbProgressSeqRef = useRef(0);
+  const dbProgressHideTimerRef = useRef<number | null>(null);
+
+  const clearDbProgressTimer = useCallback(() => {
+    if (dbProgressHideTimerRef.current !== null) {
+      window.clearTimeout(dbProgressHideTimerRef.current);
+      dbProgressHideTimerRef.current = null;
+    }
+  }, []);
+
+  const startDbProgress = useCallback(
+    (key: string, label: string, total = 0, current = 0) => {
+      clearDbProgressTimer();
+      dbProgressSeqRef.current += 1;
+      const seq = dbProgressSeqRef.current;
+      const next = {
+        ...dbProgressTasksRef.current,
+        [key]: {
+          label,
+          current: Math.max(0, Math.round(current)),
+          total: Math.max(0, Math.round(total)),
+          seq,
+        },
+      };
+      dbProgressTasksRef.current = next;
+      setDbProgressNotice(null);
+      setDbProgressTasks(next);
+    },
+    [clearDbProgressTimer]
+  );
+
+  const updateDbProgress = useCallback(
+    (key: string, current: number, total: number, label?: string) => {
+      const existing = dbProgressTasksRef.current[key];
+      const nextSeq = existing ? existing.seq : ++dbProgressSeqRef.current;
+      const next = {
+        ...dbProgressTasksRef.current,
+        [key]: {
+          label: label ?? existing?.label ?? 'Datenbankabfrage läuft…',
+          current: Math.max(0, Math.round(current)),
+          total: Math.max(0, Math.round(total)),
+          seq: nextSeq,
+        },
+      };
+      dbProgressTasksRef.current = next;
+      setDbProgressTasks(next);
+    },
+    []
+  );
+
+  const dismissDbProgress = useCallback((key: string) => {
+    if (!(key in dbProgressTasksRef.current)) return;
+    const next = { ...dbProgressTasksRef.current };
+    delete next[key];
+    dbProgressTasksRef.current = next;
+    setDbProgressTasks(next);
+  }, []);
+
+  const finishDbProgress = useCallback(
+    (key: string, summary: string, cancelled = false) => {
+      if (!(key in dbProgressTasksRef.current)) return;
+      const next = { ...dbProgressTasksRef.current };
+      delete next[key];
+      dbProgressTasksRef.current = next;
+      setDbProgressTasks(next);
+      if (Object.keys(next).length === 0) {
+        clearDbProgressTimer();
+        setDbProgressNotice({
+          summary:
+            summary.trim() ||
+            (cancelled ? 'Datenbankabfrage abgebrochen' : 'Datenbankabfrage abgeschlossen'),
+          cancelled,
+        });
+        dbProgressHideTimerRef.current = window.setTimeout(
+          () => {
+            dbProgressHideTimerRef.current = null;
+            setDbProgressNotice(null);
+          },
+          cancelled ? 4000 : 6000
+        );
+      }
+    },
+    [clearDbProgressTimer]
+  );
+
+  const clearAllDbProgress = useCallback(() => {
+    clearDbProgressTimer();
+    dbProgressTasksRef.current = {};
+    setDbProgressTasks({});
+    setDbProgressNotice(null);
+  }, [clearDbProgressTimer]);
+
+  const handleDbPreviewProgress = useCallback(
+    (state: 'start' | 'done' | 'dismiss', label?: string) => {
+      if (state === 'start') {
+        startDbProgress('preview', label || 'Album-Vorschau wird geladen…');
+      } else if (state === 'done') {
+        finishDbProgress('preview', label || 'Album-Vorschau geladen');
+      } else {
+        dismissDbProgress('preview');
+      }
+    },
+    [startDbProgress, finishDbProgress, dismissDbProgress]
+  );
+
+  useEffect(() => {
+    return () => {
+      clearDbProgressTimer();
+    };
+  }, [clearDbProgressTimer]);
+
   const buildMetadataHeaders = (extra?: Record<string, string>): Record<string, string> => {
-    const h: Record<string, string> = { ...(extra || {}) };
+    const h: Record<string, string> = {
+      'User-Agent': 'MintRip-Studio/1.0',
+      ...(extra || {}),
+    };
     if (settings.discogsToken?.trim()) {
       h['x-discogs-token'] = settings.discogsToken.trim();
     }
     if (settings.lastfmApiKey?.trim()) {
       h['x-lastfm-api-key'] = settings.lastfmApiKey.trim();
     }
-    const mbUrl = normalizeMusicBrainzServerUrl(settings.musicbrainzServerUrl);
+    let mbUrl = DEFAULT_MUSICBRAINZ_SERVER_URL;
+    if (typeof settings.mbUseLocalMirror === 'boolean') {
+      mbUrl = buildMusicBrainzServerUrl(
+        settings.mbUseLocalMirror,
+        settings.mbLocalHost ?? DEFAULT_MB_LOCAL_HOST,
+        settings.mbLocalPort ?? DEFAULT_MB_LOCAL_PORT
+      );
+    } else if (settings.musicbrainzServerUrl) {
+      const parsed = parseMusicBrainzLocalHostPort(settings.musicbrainzServerUrl);
+      mbUrl = buildMusicBrainzServerUrl(parsed.useLocalMirror, parsed.host, parsed.port);
+    }
     if (mbUrl && mbUrl !== DEFAULT_MUSICBRAINZ_SERVER_URL) {
       h['x-mb-server-url'] = mbUrl;
     }
+    h['x-mb-fallback-official'] = settings.mbFallbackToOfficial !== false ? 'true' : 'false';
     h['x-mb-deep-relations'] = settings.mbLoadDeepRelations ? 'true' : 'false';
     h['x-prefer-subgenres'] = settings.preferSubgenres !== false ? 'true' : 'false';
     h['x-auto-enrich-genres'] = settings.autoEnrichTrackGenres !== false ? 'true' : 'false';
@@ -1296,6 +1441,10 @@ export default function App() {
     setAwaitingAlbumSelection(false);
     setSearchError(null);
     setIsSearching(true);
+    startDbProgress(
+      'hits',
+      'Onlinedatenbanken werden per TOC abgefragt… (MusicBrainz · Discogs · CDDB / GnuDB)'
+    );
     if (!autoSelectFirst) {
       setActiveRightDisplay('hits');
     }
@@ -1335,6 +1484,12 @@ export default function App() {
         return tc > 0 && (tc === sourceTrackCount || (tc > sourceTrackCount && mc > 1));
       });
       setSearchResults(releases);
+      finishDbProgress(
+        'hits',
+        releases.length > 0
+          ? `Datenbankabfrage abgeschlossen: ${releases.length} Album-Treffer gefunden`
+          : 'Datenbankabfrage abgeschlossen: Keine Treffer gefunden'
+      );
       if (releases.length === 0) {
         setAwaitingAlbumSelection(false);
         setActiveRightDisplay('hits');
@@ -1361,6 +1516,7 @@ export default function App() {
         err instanceof Error
           ? err.message
           : 'Online-Abfrage über virtuelle Datei-TOC fehlgeschlagen.';
+      finishDbProgress('hits', 'Datenbankabfrage fehlgeschlagen');
       appendQueryLog(`Fehler bei TOC-Abfrage: ${msg}`);
       setSearchError(msg);
       if (extraHints?.throwOnError) throw err;
@@ -1412,6 +1568,14 @@ export default function App() {
       /\[\s*[rm]?\s*\d{2,12}\s*\]/i.test(clean) ||
       /^(?:discogs\s*:\s*)?(?:(?:release|master)\s*[:/]\s*)?\[?\s*[rm]\s*\d{2,12}\s*\]?$/i.test(clean);
     const isBarcode = !isDiscogsCode && /^\d{8,14}$/.test(clean.replace(/[\s-]+/g, ''));
+    startDbProgress(
+      'hits',
+      isDiscogsCode
+        ? `Discogs-Abfrage läuft für „${clean}“…`
+        : isBarcode
+          ? `Barcode/QR-Abfrage läuft für „${clean}“… (MusicBrainz · Discogs)`
+          : `Onlinedatenbanken werden abgefragt für „${clean}“… (MusicBrainz · Discogs · CDDB / GnuDB)`
+    );
     appendQueryLog(
       isDiscogsCode
         ? `[Discogs-Code] Starte direkte Discogs-Abfrage für „${clean}“...`
@@ -1458,6 +1622,12 @@ export default function App() {
         return tc > 0 && (tc === sourceTrackCount || (tc > sourceTrackCount && mc > 1));
       });
       setSearchResults(releases);
+      finishDbProgress(
+        'hits',
+        releases.length > 0
+          ? `Datenbanksuche abgeschlossen: ${releases.length} Album-Treffer gefunden`
+          : 'Datenbanksuche abgeschlossen: Keine Treffer gefunden'
+      );
       if (releases.length === 0) {
         setAwaitingAlbumSelection(false);
         setActiveRightDisplay('hits');
@@ -1482,6 +1652,7 @@ export default function App() {
         err instanceof Error
           ? err.message
           : 'Online-Suche (MusicBrainz + CDDB + Discogs) fehlgeschlagen.';
+      finishDbProgress('hits', 'Datenbanksuche fehlgeschlagen');
       appendQueryLog(`Fehler: ${msg}`);
       setSearchError(msg);
       if (throwOnError) throw err;
@@ -1494,6 +1665,12 @@ export default function App() {
   const handleEnrichTrackGenres = async () => {
     if (album.tracks.length === 0 || isEnrichingGenres) return;
     setIsEnrichingGenres(true);
+    startDbProgress(
+      'enrich',
+      `Track-Genres werden angereichert (${album.tracks.length} Tracks · MusicBrainz · Discogs${
+        settings.lastfmApiKey?.trim() ? ' · Last.fm' : ''
+      })…`
+    );
     appendQueryLog(
       `[Track-Genre-Enrichment] Starte Multi-Source-Genre-Abfrage (Release-Group, Discogs Styles${
         settings.lastfmApiKey?.trim() ? ', Last.fm' : ''
@@ -1543,10 +1720,16 @@ export default function App() {
       const sourcesLabel = Array.isArray(data.sources) && data.sources.length > 0
         ? data.sources.join(', ')
         : 'keine neuen Quellen';
+      const updatedCount = Number(data.updatedTracks || 0);
+      finishDbProgress(
+        'enrich',
+        `Track-Genres abgeschlossen: ${updatedCount} Titel aktualisiert (${sourcesLabel})`
+      );
       appendQueryLog(
-        `[Track-Genre-Enrichment] Fertig: ${Number(data.updatedTracks || 0)} Track-Genres aktualisiert (${sourcesLabel}).`
+        `[Track-Genre-Enrichment] Fertig: ${updatedCount} Track-Genres aktualisiert (${sourcesLabel}).`
       );
     } catch (err) {
+      finishDbProgress('enrich', 'Track-Genre-Anreicherung fehlgeschlagen');
       appendQueryLog(
         `[Track-Genre-Enrichment] Fehler: ${err instanceof Error ? err.message : 'Unbekannter Fehler'}`
       );
@@ -1595,6 +1778,10 @@ export default function App() {
       const loadAllDiscs = discNumber === 0 || (localDiscSet.size > 1 && effectiveSource !== 'cddb');
       const reqDiscParam = loadAllDiscs ? 'all' : String(discNumber);
 
+      startDbProgress(
+        'release',
+        `Album & Titelliste werden geladen… (${sourceLabel})`
+      );
       appendQueryLog(
         `Lade vollständige Release-Metadaten von ${sourceLabel} (ID: ${idOrPrefixed}, ${loadAllDiscs ? 'alle CDs' : `CD ${discNumber}`})...`
       );
@@ -1854,8 +2041,13 @@ export default function App() {
       // 2.2: Exklusiv Display 2 ("Titel- & Metadaten-Verwaltung") öffnen; Display 1 & Display 3 automatisch schließen
       setAwaitingAlbumSelection(false);
       setActiveRightDisplay('tracks');
+      finishDbProgress(
+        'release',
+        `Album geladen: ${rel.artist} – ${normalizedRelTitle} (${tocResult.tracksWithLsn.length} Titel)`
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Release konnte nicht geladen werden.';
+      finishDbProgress('release', 'Album konnte nicht geladen werden');
       appendQueryLog(`Fehler beim Release-Abruf: ${msg}`);
       setSearchError(msg);
       if (throwOnError) throw err;
@@ -1873,9 +2065,21 @@ export default function App() {
     const action = lastQueryActionRef.current;
     const delaysMs = [0, 1000, 2000, 4000, 8000];
 
+    startDbProgress(
+      'retry',
+      `Metadaten-Abfrage wird wiederholt (Versuch 1/${retryMaxAttempts})…`,
+      retryMaxAttempts,
+      0
+    );
     try {
       for (let attempt = 1; attempt <= retryMaxAttempts; attempt++) {
         setRetryAttempt(attempt);
+        updateDbProgress(
+          'retry',
+          attempt - 1,
+          retryMaxAttempts,
+          `Metadaten-Abfrage wird wiederholt (Versuch ${attempt}/${retryMaxAttempts})…`
+        );
         const waitMs = delaysMs[attempt - 1] || 0;
         if (waitMs > 0) {
           appendQueryLog(
@@ -1907,6 +2111,10 @@ export default function App() {
               throwOnError: true,
             });
           }
+          finishDbProgress(
+            'retry',
+            `Datenbankabfrage erfolgreich abgeschlossen (Versuch ${attempt}/${retryMaxAttempts})`
+          );
           appendQueryLog(
             `[Backoff-Retry] Metadaten-Abfrage im Versuch ${attempt}/${retryMaxAttempts} erfolgreich abgeschlossen.`
           );
@@ -1918,6 +2126,7 @@ export default function App() {
             `[Backoff-Retry] Versuch ${attempt}/${retryMaxAttempts} fehlgeschlagen (${errMsg}).`
           );
           if (attempt === retryMaxAttempts) {
+            finishDbProgress('retry', 'Datenbankabfrage nach Wiederholungsversuchen fehlgeschlagen');
             setSearchError(
               `Metadaten-Abfrage nach ${retryMaxAttempts} exponentiellen Backoff-Versuchen fehlgeschlagen: ${errMsg}`
             );
@@ -1969,6 +2178,13 @@ export default function App() {
     if (shazamingTrackIds.includes(trackId)) return false;
 
     const trkPad = String(targetTrack.trackNumber).padStart(2, '0');
+    const isStandaloneShazam = !signal;
+    if (isStandaloneShazam) {
+      startDbProgress(
+        'shazam_single',
+        `Shazam-Abfrage (#${trkPad}): „${targetTrack.title || `Track #${trkPad}`}“…`
+      );
+    }
     setShazamingTrackIds((prev) => [...prev, trackId]);
 
     try {
@@ -2145,18 +2361,30 @@ export default function App() {
         };
       });
 
+      if (isStandaloneShazam) {
+        finishDbProgress('shazam_single', `Shazam abgeschlossen (#${trkPad}): Treffer übernommen`);
+      }
       return true;
     } catch (err) {
       if (
         signal?.aborted ||
         (err instanceof Error && err.name === 'AbortError')
       ) {
+        if (isStandaloneShazam) {
+          finishDbProgress('shazam_single', `Shazam abgebrochen (#${trkPad})`, true);
+        }
         return false;
+      }
+      if (isStandaloneShazam) {
+        finishDbProgress('shazam_single', `Shazam (#${trkPad}): Kein Treffer`);
       }
       const msg = err instanceof Error ? err.message : 'Shazam-Abfrage fehlgeschlagen.';
       appendQueryLog(`[Shazam #${trkPad}] Fehler: ${msg}`);
       return false;
     } finally {
+      if (isStandaloneShazam && 'shazam_single' in dbProgressTasksRef.current) {
+        finishDbProgress('shazam_single', `Shazam abgeschlossen (#${trkPad})`);
+      }
       setShazamingTrackIds((prev) => prev.filter((id) => id !== trackId));
     }
   };
@@ -2167,6 +2395,7 @@ export default function App() {
       shazamAbortRef.current = null;
     }
     setIsShazamingAll(false);
+    finishDbProgress('shazam', 'Shazam-Abfrage abgebrochen', true);
     appendQueryLog(
       '[Shazam befragen] Stopp-Anforderung gesendet – laufende Shazam-Abfrage wird abgebrochen (bisherige Treffer bleiben erhalten)...'
     );
@@ -2189,6 +2418,12 @@ export default function App() {
     shazamAbortRef.current = controller;
     setIsShazamingAll(true);
     const trackSnapshot = [...selectedTracks];
+    startDbProgress(
+      'shazam',
+      `Shazam-Abfrage: 0/${trackSnapshot.length} Titel…`,
+      trackSnapshot.length,
+      0
+    );
     appendQueryLog(
       `[Shazam befragen] Starte schlüssellose Shazam-Abfrage für ${trackSnapshot.length} ausgewählte(n) Titel...`
     );
@@ -2200,8 +2435,21 @@ export default function App() {
         if (controller.signal.aborted) break;
         processed++;
         const trk = trackSnapshot[i];
+        const trkLabel = (trk.title || '').trim() || `Track #${String(trk.trackNumber).padStart(2, '0')}`;
+        updateDbProgress(
+          'shazam',
+          i,
+          trackSnapshot.length,
+          `Shazam-Abfrage (${processed}/${trackSnapshot.length}): „${trkLabel}“…`
+        );
         const ok = await handleShazamTrack(trk.id, controller.signal);
         if (ok) hits++;
+        updateDbProgress(
+          'shazam',
+          processed,
+          trackSnapshot.length,
+          `Shazam-Abfrage (${processed}/${trackSnapshot.length}): „${trkLabel}“`
+        );
         if (controller.signal.aborted) break;
         if (i + 1 < trackSnapshot.length) {
           await new Promise<void>((resolve) => {
@@ -2222,10 +2470,19 @@ export default function App() {
         }
       }
       if (controller.signal.aborted) {
+        finishDbProgress(
+          'shazam',
+          `Shazam abgebrochen (${hits}/${processed} Treffer)`,
+          true
+        );
         appendQueryLog(
           `[Shazam befragen] Abfrage vom Benutzer gestoppt (${hits} von ${processed} geprüften / ${trackSnapshot.length} ausgewählten Titeln identifiziert; bisherige Treffer bleiben erhalten).`
         );
       } else {
+        finishDbProgress(
+          'shazam',
+          `Shazam abgeschlossen: ${hits}/${trackSnapshot.length} Titel identifiziert`
+        );
         appendQueryLog(
           `[Shazam befragen] Abgeschlossen: ${hits} von ${trackSnapshot.length} ausgewählten Titeln erfolgreich über Shazam identifiziert.`
         );
@@ -2244,6 +2501,7 @@ export default function App() {
       mbTracksAbortRef.current = null;
     }
     setIsAnalyzingMbTracks(false);
+    finishDbProgress('mb_tracks', 'MusicBrainz Einzelanalyse abgebrochen', true);
     appendQueryLog(
       '[MusicBrainz Einzeltracks] Stopp-Anforderung gesendet – laufende Einzeltrackanalyse wird abgebrochen (bisherige Treffer bleiben erhalten)...'
     );
@@ -2268,6 +2526,12 @@ export default function App() {
 
     const trackSnapshot = [...selectedTracks];
     const fallbackArtist = (album.artist || album.albumArtist || '').trim();
+    startDbProgress(
+      'mb_tracks',
+      `MusicBrainz Einzelanalyse: 0/${trackSnapshot.length} Titel…`,
+      trackSnapshot.length,
+      0
+    );
     appendQueryLog(
       `[MusicBrainz Einzeltracks] Starte Einzeltrackanalyse für ${trackSnapshot.length} per Checkbox ausgewählte(n) Titel (befüllt Interpret, Titel & Genre)...`
     );
@@ -2280,10 +2544,17 @@ export default function App() {
         processed++;
         const trk = trackSnapshot[i];
         const trkPad = String(trk.trackNumber).padStart(2, '0');
+        const trkLabel = (trk.title || '').trim() || `Track #${trkPad}`;
+        updateDbProgress(
+          'mb_tracks',
+          i,
+          trackSnapshot.length,
+          `MusicBrainz Einzelanalyse (${processed}/${trackSnapshot.length}): „${trkLabel}“…`
+        );
         try {
           const resp = await fetch('/api/musicbrainz/analyze-track', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: buildMetadataHeaders({ 'Content-Type': 'application/json' }),
             signal: controller.signal,
             body: JSON.stringify({
               trackNumber: trk.trackNumber,
@@ -2291,6 +2562,7 @@ export default function App() {
               artist: trk.artist,
               fallbackArtist,
               isrc: trk.isrc,
+              musicbrainzRecordingId: trk.musicbrainzRecordingId || '',
               durationSeconds: trk.durationSeconds,
               fileName: trk.sourceFileName || '',
             }),
@@ -2404,6 +2676,13 @@ export default function App() {
           appendQueryLog(`[MusicBrainz Einzeltrack #${trkPad}] Fehler: ${msg}`);
         }
 
+        updateDbProgress(
+          'mb_tracks',
+          processed,
+          trackSnapshot.length,
+          `MusicBrainz Einzelanalyse (${processed}/${trackSnapshot.length}): „${trkLabel}“`
+        );
+
         if (controller.signal.aborted) break;
         if (i + 1 < trackSnapshot.length) {
           await new Promise<void>((resolve) => {
@@ -2425,10 +2704,19 @@ export default function App() {
       }
 
       if (controller.signal.aborted) {
+        finishDbProgress(
+          'mb_tracks',
+          `MusicBrainz Einzelanalyse abgebrochen (${hits}/${processed} aktualisiert)`,
+          true
+        );
         appendQueryLog(
           `[MusicBrainz Einzeltracks] Analyse vom Benutzer gestoppt (${hits} von ${processed} geprüften / ${trackSnapshot.length} ausgewählten Titeln aktualisiert).`
         );
       } else {
+        finishDbProgress(
+          'mb_tracks',
+          `MusicBrainz Einzelanalyse abgeschlossen: ${hits}/${trackSnapshot.length} Titel aktualisiert`
+        );
         appendQueryLog(
           `[MusicBrainz Einzeltracks] Abgeschlossen: ${hits} von ${trackSnapshot.length} ausgewählten Titeln erfolgreich aktualisiert (Interpret, Titel & Genre).`
         );
@@ -2447,6 +2735,7 @@ export default function App() {
       verifyAbortRef.current = null;
     }
     setVerifyingField(null);
+    finishDbProgress('verify', 'Prüfung abgebrochen', true);
   };
 
   // Online-Prüfung, Rechtschreibkorrektur & Internationalisierung (mehrere Werte mit ; getrennt)
@@ -2497,6 +2786,10 @@ export default function App() {
     const controller = new AbortController();
     verifyAbortRef.current = controller;
     setVerifyingField(field);
+    startDbProgress(
+      'verify',
+      `${nounMap[field]}-Prüfung läuft (MusicBrainz & Wikidata)…`
+    );
     appendQueryLog(
       includeAlbumFields
         ? `${tagMap[field]} Starte Prüfung & Internationalisierung (${nounMap[field]}, ;-getrennte Mehrfachwerte) für Album & ${selectedTracks.length} ausgewählte Titel...`
@@ -2547,10 +2840,10 @@ export default function App() {
     try {
       const resp = await fetch('/api/artists/verify-international', {
         method: 'POST',
-        headers: {
+        headers: buildMetadataHeaders({
           'Content-Type': 'application/json',
           'x-verify-stream': 'ndjson',
-        },
+        }),
         signal: controller.signal,
         body: JSON.stringify({
           field,
@@ -2648,12 +2941,17 @@ export default function App() {
         }
         applyDonePayload(data);
       }
+      if (!controller.signal.aborted) {
+        finishDbProgress('verify', `${nounMap[field]}-Prüfung abgeschlossen`);
+      }
     } catch (err) {
       if (controller.signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
+        finishDbProgress('verify', `${nounMap[field]}-Prüfung abgebrochen`, true);
         appendQueryLog(
           `${tagMap[field]} Abfrage vom Benutzer gestoppt (bereits geprüfte Ergebnisse bleiben erhalten).`
         );
       } else {
+        finishDbProgress('verify', `${nounMap[field]}-Prüfung fehlgeschlagen`);
         const msg =
           err instanceof Error ? err.message : `${nounMap[field]}-Prüfung fehlgeschlagen.`;
         appendQueryLog(`${tagMap[field]} Fehler: ${msg}`);
@@ -2674,6 +2972,7 @@ export default function App() {
       coverSearchAbortRef.current = null;
     }
     setIsFetchingCover(false);
+    finishDbProgress('cover', 'Cover-Suche abgebrochen', true);
     appendQueryLog('[Cover-Suche] Online-Cover-Suche vom Benutzer abgebrochen.');
   };
 
@@ -2727,6 +3026,12 @@ export default function App() {
     const artistVal = (album.albumArtist || album.artist || '').trim();
     const titleVal = (album.title || '').trim();
     const defaultLabel = `${artistVal || '—'} – ${titleVal || '—'}`;
+    startDbProgress(
+      'cover',
+      `Cover-Suche läuft (${enabledProviders.length} Bilddatenbanken) für „${
+        queryFromBar || defaultLabel
+      }“…`
+    );
     appendQueryLog(
       `[Cover-Suche] Starte Vollabfrage über ${enabledProviders.length} aktivierte Quellen (${providerLabels.join(' · ')}) für „${
         queryFromBar || defaultLabel
@@ -2783,6 +3088,10 @@ export default function App() {
       }
 
       setCoverCandidates(candidates);
+      finishDbProgress(
+        'cover',
+        `Cover-Suche abgeschlossen: ${candidates.length} Treffer gefunden`
+      );
       if (activeTab === 'module_cover') {
         setIsCoverPickerOpen(false);
         appendQueryLog(
@@ -2796,9 +3105,11 @@ export default function App() {
       }
     } catch (err) {
       if (controller.signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
+        finishDbProgress('cover', 'Cover-Suche abgebrochen', true);
         return;
       }
       const msg = err instanceof Error ? err.message : 'Cover-Download fehlgeschlagen.';
+      finishDbProgress('cover', 'Cover-Suche abgeschlossen: Keine Treffer gefunden');
       appendQueryLog(`Cover-Fehler: ${msg}`);
       setCoverError(msg);
     } finally {
@@ -2890,9 +3201,13 @@ export default function App() {
     let overlayActivatedEarly = false;
     if (resetBeforeImport) {
       handleResetAllFields();
-      setActiveRightDisplay('hits');
-      setIsSearching(true);
-      overlayActivatedEarly = true;
+      if (options?.autoLookupToc) {
+        setActiveRightDisplay('hits');
+        setIsSearching(true);
+        overlayActivatedEarly = true;
+      } else {
+        setActiveRightDisplay('tracks');
+      }
     }
 
     try {
@@ -3583,6 +3898,7 @@ export default function App() {
     setIsShazamingAll(false);
     setShazamingTrackIds([]);
     setVerifyingField(null);
+    clearAllDbProgress();
     setCoverCandidates([]);
     setIsCoverPickerOpen(false);
     setIsApplyingCoverCandidate(false);
@@ -3846,7 +4162,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F4F5F6] dark:bg-[#1C1F23] text-[#1F2328] dark:text-[#EAEEF2] transition-colors">
+    <div className="min-h-screen pb-9 flex flex-col bg-[#F4F5F6] dark:bg-[#1C1F23] text-[#1F2328] dark:text-[#EAEEF2] transition-colors">
       {/* Obere Toolbar: ohne "Einstellungen"-Button (Aufruf über die Kachel auf der Startseite) */}
       {(() => {
         const isMinimalToolbarView =
@@ -4386,6 +4702,7 @@ export default function App() {
             onBatchRetryJob={handleBatchRetryJob}
             onBatchRemoveJob={handleBatchRemoveJob}
             onBatchDropFiles={(files) => void ingestAudioFiles(files, true)}
+            onDbPreviewProgress={handleDbPreviewProgress}
           />
         )}
 
@@ -4507,8 +4824,8 @@ export default function App() {
         )}
       </main>
 
-      {/* Unterer Fensterrand: angedocktes Aktions-Protokoll */}
-      <div className="sticky bottom-0 z-30 w-full flex flex-col">
+      {/* Unterer Fensterrand: angedocktes Aktions-Protokoll (direkt über der festen Fortschrittsleiste) */}
+      <div className="sticky bottom-9 z-30 w-full flex flex-col">
       {settings.showQueryLog && !isQueryLogDetached && (
         <section
           aria-label="Aktions- und Abfrage-Protokoll"
@@ -4644,6 +4961,149 @@ export default function App() {
         </section>
       )}
       </div>
+
+      {/* Fest am unteren Fensterrand verankerte Fortschrittsleiste für alle Datenbankabfragen */}
+      {(() => {
+        const activeList = [...Object.values(dbProgressTasks)];
+
+        // Fallback-Sicherheitsnetz, falls eine Abfrage über State-Flags läuft
+        if (activeList.length === 0) {
+          if (isAnalyzingMbTracks) {
+            activeList.push({ label: 'MusicBrainz Einzelanalyse läuft…', current: 0, total: 0, seq: 1 });
+          } else if (isShazamingAll || shazamingTrackIds.length > 0) {
+            activeList.push({ label: 'Shazam-Abfrage läuft…', current: 0, total: 0, seq: 1 });
+          } else if (isLoadingRelease) {
+            activeList.push({ label: 'Album & Titelliste werden geladen…', current: 0, total: 0, seq: 1 });
+          } else if (isSearching || isRetryingBackoff) {
+            activeList.push({
+              label: 'Onlinedatenbanken werden abgefragt… (MusicBrainz · Discogs · CDDB)',
+              current: 0,
+              total: 0,
+              seq: 1,
+            });
+          } else if (isFetchingCover) {
+            activeList.push({ label: 'Cover-Datenbanken werden abgefragt…', current: 0, total: 0, seq: 1 });
+          } else if (verifyingField !== null) {
+            activeList.push({ label: 'Namensprüfung läuft (MusicBrainz & Wikidata)…', current: 0, total: 0, seq: 1 });
+          } else if (isEnrichingGenres) {
+            activeList.push({ label: 'Track-Genres werden angereichert…', current: 0, total: 0, seq: 1 });
+          }
+        }
+
+        const hasActive = activeList.length > 0;
+        let activeTask: { label: string; current: number; total: number; seq: number } | null = null;
+        if (hasActive) {
+          const detTasks = activeList.filter((t) => t.total > 0);
+          const pool = detTasks.length > 0 ? detTasks : activeList;
+          activeTask = pool.reduce((best, cur) => (cur.seq >= best.seq ? cur : best), pool[0]);
+        }
+        const extraCount = hasActive ? activeList.length - 1 : 0;
+        const extraSuffix =
+          extraCount === 1
+            ? ' (+1 weitere Abfrage)'
+            : extraCount > 1
+              ? ` (+${extraCount} weitere Abfragen)`
+              : '';
+
+        const isDeterminate = Boolean(activeTask && activeTask.total > 0);
+        const rawPct = isDeterminate && activeTask
+          ? Math.max(0, Math.min(100, Math.round((activeTask.current / activeTask.total) * 100)))
+          : 0;
+        const visualPct = hasActive && isDeterminate ? Math.max(5, rawPct) : 100;
+
+        const isCancelledNotice = !hasActive && Boolean(dbProgressNotice?.cancelled);
+        const isDoneNotice = !hasActive && Boolean(dbProgressNotice && !dbProgressNotice.cancelled);
+        const isIdle = !hasActive && !dbProgressNotice;
+
+        const barLabel = hasActive && activeTask
+          ? `${activeTask.label}${extraSuffix}`
+          : dbProgressNotice
+            ? dbProgressNotice.summary
+            : 'Bereit — keine aktive Datenbankabfrage';
+
+        const counterText = hasActive && activeTask
+          ? isDeterminate
+            ? `${activeTask.current}/${activeTask.total} · ${rawPct} %`
+            : 'Läuft…'
+          : isCancelledNotice
+            ? 'Abgebrochen'
+            : isDoneNotice
+              ? '100 %'
+              : 'Bereit';
+
+        return (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`fixed bottom-0 left-0 right-0 z-50 h-9 border-t shadow-[0_-2px_10px_rgba(0,0,0,0.07)] flex items-center transition-colors ${
+              hasActive
+                ? 'bg-[#EDF7E8] dark:bg-[#1E2A1C] border-[#5BA632]/50'
+                : isDoneNotice
+                  ? 'bg-[#E3F4DC] dark:bg-[#1E331B] border-[#5BA632]/65'
+                  : isCancelledNotice
+                    ? 'bg-amber-50 dark:bg-[#2B2418] border-amber-500/45'
+                    : 'bg-[#EEF1F4] dark:bg-[#181B20] border-[#D0D7DE] dark:border-[#343A40]'
+            }`}
+          >
+            <div className="max-w-[1440px] w-full mx-auto px-6 flex items-center gap-3">
+              {hasActive ? (
+                <Loader2 className="w-4 h-4 text-[#5BA632] dark:text-[#69B53F] animate-spin shrink-0" />
+              ) : isCancelledNotice ? (
+                <Square className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 fill-current shrink-0" />
+              ) : isDoneNotice ? (
+                <CheckCircle2 className="w-4 h-4 text-[#3F7E1F] dark:text-[#86DC5A] shrink-0" />
+              ) : (
+                <span className="w-2 h-2 rounded-full bg-[#8C959F] dark:bg-[#6E7681] shrink-0" />
+              )}
+
+              <span
+                className={`text-xs truncate flex-1 min-w-0 ${
+                  isDoneNotice
+                    ? 'font-semibold text-[#2E6B14] dark:text-[#9BE270]'
+                    : isCancelledNotice
+                      ? 'font-semibold text-amber-800 dark:text-amber-300'
+                      : hasActive
+                        ? 'font-semibold text-[#1F2328] dark:text-[#EAEEF2]'
+                        : 'text-[#57606A] dark:text-[#8B949E]'
+                }`}
+                title={barLabel}
+              >
+                {barLabel}
+              </span>
+
+              <div className="w-48 sm:w-64 shrink-0 flex items-center">
+                {hasActive && !isDeterminate ? (
+                  <div className="w-full h-2.5 rounded-full bg-slate-400/25 dark:bg-slate-600/40 overflow-hidden relative">
+                    <div className="h-full w-2/5 rounded-full bg-[#5BA632] dark:bg-[#69B53F] animate-db-progress-indeterminate" />
+                  </div>
+                ) : (
+                  <progress
+                    value={isIdle || isCancelledNotice ? 0 : visualPct}
+                    max={100}
+                    className={`db-progress-native w-full h-2.5 ${
+                      isCancelledNotice ? 'db-progress-cancelled' : ''
+                    }`}
+                  />
+                )}
+              </div>
+
+              <span
+                className={`text-[11px] font-mono tabular-nums shrink-0 min-w-[82px] text-right ${
+                  isDoneNotice
+                    ? 'font-semibold text-[#2E6B14] dark:text-[#9BE270]'
+                    : isCancelledNotice
+                      ? 'font-semibold text-amber-800 dark:text-amber-300'
+                      : hasActive
+                        ? 'font-semibold text-[#1F2328] dark:text-[#EAEEF2]'
+                        : 'text-[#57606A] dark:text-[#8B949E]'
+                }`}
+              >
+                {counterText}
+              </span>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Abgedocktes eigenes Protokoll-Fenster (beweglich, skalierbar, mit Andock-Button für alte Stelle) */}
       {settings.showQueryLog && isQueryLogDetached && (

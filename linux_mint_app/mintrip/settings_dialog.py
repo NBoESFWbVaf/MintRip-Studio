@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from typing import Callable
 
 import gi
@@ -12,12 +13,19 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
 from .icons import make_system_icon, resolve_program_icon_name
-from .metadata_service import clear_metadata_cache, get_metadata_cache_stats
+from .metadata_service import (
+    clear_metadata_cache,
+    get_metadata_cache_stats,
+    reset_musicbrainz_mirror_cooldown,
+    test_musicbrainz_connection,
+)
 from .models import (
     COVER_PROVIDER_OPTIONS,
     DEFAULT_COVER_MAX_DIMENSION,
     DEFAULT_COVER_PROVIDERS,
     DEFAULT_MAX_THREADS,
+    DEFAULT_MB_LOCAL_HOST,
+    DEFAULT_MB_LOCAL_PORT,
     DEFAULT_MUSICBRAINZ_SERVER_URL,
     DEFAULT_OUTPUT_DIR_CONVERT,
     DEFAULT_OUTPUT_DIR_COVER,
@@ -32,12 +40,16 @@ from .models import (
     ExportFormat,
     ExportSettings,
     Mp3QualityMode,
+    build_musicbrainz_server_url,
     normalize_cover_max_dimension,
     normalize_cover_providers,
     normalize_max_threads,
+    normalize_mb_local_host,
+    normalize_mb_local_port,
     normalize_musicbrainz_server_url,
     normalize_shazam_sample_size,
     normalize_visible_left_tag_fields,
+    parse_musicbrainz_local_host_port,
 )
 
 CONFIG_PATH = Path.home() / ".config" / "mintrip" / "settings.json"
@@ -124,10 +136,25 @@ def load_saved_settings() -> ExportSettings:
             settings.discogs_token = str(data["discogs_token"] or "").strip()
         if "lastfm_api_key" in data:
             settings.lastfm_api_key = str(data["lastfm_api_key"] or "").strip()
-        if "musicbrainz_server_url" in data:
-            settings.musicbrainz_server_url = normalize_musicbrainz_server_url(
+        if "mb_use_local_mirror" in data:
+            settings.mb_use_local_mirror = bool(data["mb_use_local_mirror"])
+            settings.mb_local_host = normalize_mb_local_host(data.get("mb_local_host", DEFAULT_MB_LOCAL_HOST))
+            settings.mb_local_port = normalize_mb_local_port(data.get("mb_local_port", DEFAULT_MB_LOCAL_PORT))
+            settings.musicbrainz_server_url = build_musicbrainz_server_url(
+                settings.mb_use_local_mirror, settings.mb_local_host, settings.mb_local_port
+            )
+        elif "musicbrainz_server_url" in data:
+            parsed_local, parsed_host, parsed_port = parse_musicbrainz_local_host_port(
                 data["musicbrainz_server_url"]
             )
+            settings.mb_use_local_mirror = parsed_local
+            settings.mb_local_host = parsed_host
+            settings.mb_local_port = parsed_port
+            settings.musicbrainz_server_url = build_musicbrainz_server_url(
+                parsed_local, parsed_host, parsed_port
+            )
+        if "mb_fallback_to_official" in data:
+            settings.mb_fallback_to_official = bool(data["mb_fallback_to_official"])
         if "mb_load_deep_relations" in data:
             settings.mb_load_deep_relations = bool(data["mb_load_deep_relations"])
         if "prefer_subgenres" in data:
@@ -212,8 +239,14 @@ def save_settings(settings: ExportSettings, theme_mode: str | None = None) -> No
         ),
         "discogs_token": settings.discogs_token.strip(),
         "lastfm_api_key": str(getattr(settings, "lastfm_api_key", "") or "").strip(),
-        "musicbrainz_server_url": normalize_musicbrainz_server_url(
-            getattr(settings, "musicbrainz_server_url", DEFAULT_MUSICBRAINZ_SERVER_URL)
+        "mb_use_local_mirror": bool(getattr(settings, "mb_use_local_mirror", False)),
+        "mb_local_host": normalize_mb_local_host(getattr(settings, "mb_local_host", DEFAULT_MB_LOCAL_HOST)),
+        "mb_local_port": normalize_mb_local_port(getattr(settings, "mb_local_port", DEFAULT_MB_LOCAL_PORT)),
+        "mb_fallback_to_official": bool(getattr(settings, "mb_fallback_to_official", True)),
+        "musicbrainz_server_url": build_musicbrainz_server_url(
+            bool(getattr(settings, "mb_use_local_mirror", False)),
+            getattr(settings, "mb_local_host", DEFAULT_MB_LOCAL_HOST),
+            getattr(settings, "mb_local_port", DEFAULT_MB_LOCAL_PORT),
         ),
         "mb_load_deep_relations": bool(getattr(settings, "mb_load_deep_relations", False)),
         "prefer_subgenres": bool(getattr(settings, "prefer_subgenres", True)),
@@ -926,25 +959,75 @@ class SettingsPanel(Gtk.Box):
         lastfm_row.pack_start(self.check_show_lastfm_key, False, False, 0)
         tab4.pack_start(lastfm_row, False, False, 0)
 
-        mb_srv_lbl = Gtk.Label(
-            label="MusicBrainz-Server-URL (Standard oder eigener lokaler Docker-Mirror ohne Rate-Limit):"
+        self.check_mb_use_local_mirror = Gtk.CheckButton(
+            label="Lokalen MusicBrainz-Docker-Container verwenden (ohne 1-Anfrage/Sekunde-Limit)"
         )
-        mb_srv_lbl.set_xalign(0)
-        tab4.pack_start(mb_srv_lbl, False, False, 0)
+        self.check_mb_use_local_mirror.set_active(bool(getattr(self.settings, "mb_use_local_mirror", False)))
+        self.check_mb_use_local_mirror.set_tooltip_text(
+            "Leitet alle MusicBrainz-Abfragen an deinen lokalen Docker-Mirror weiter (ohne Rate-Limit). Deaktiviert = direkt offizielle Server (musicbrainz.org)."
+        )
+        self.check_mb_use_local_mirror.connect("toggled", self._on_mb_mirror_settings_changed)
+        tab4.pack_start(self.check_mb_use_local_mirror, False, False, 0)
 
-        self.entry_mb_server_url = Gtk.Entry()
-        self.entry_mb_server_url.set_text(
-            normalize_musicbrainz_server_url(
-                getattr(self.settings, "musicbrainz_server_url", DEFAULT_MUSICBRAINZ_SERVER_URL)
-            )
+        self.mb_local_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.mb_local_row.set_margin_start(22)
+
+        mb_host_lbl = Gtk.Label(label="Host / IP:")
+        self.mb_local_row.pack_start(mb_host_lbl, False, False, 0)
+
+        self.entry_mb_local_host = Gtk.Entry()
+        self.entry_mb_local_host.set_text(
+            normalize_mb_local_host(getattr(self.settings, "mb_local_host", DEFAULT_MB_LOCAL_HOST))
         )
-        self.entry_mb_server_url.set_placeholder_text(
-            "https://musicbrainz.org/ws/2 oder http://localhost:5000/ws/2"
+        self.entry_mb_local_host.set_placeholder_text("localhost oder 192.168.178.10")
+        self.entry_mb_local_host.set_tooltip_text(
+            "Hostname oder IP-Adresse deines MusicBrainz-Docker-Containers (z. B. localhost, 127.0.0.1 oder LAN-IP; optional mit https://)."
         )
-        self.entry_mb_server_url.set_tooltip_text(
-            "Bei einem lokalen Mirror (z. B. http://localhost:5000/ws/2) wird die 1-Anfrage/Sekunde-Drosselung automatisch deaktiviert."
+        self.entry_mb_local_host.connect("changed", self._on_mb_mirror_settings_changed)
+        self.mb_local_row.pack_start(self.entry_mb_local_host, True, True, 0)
+
+        mb_port_lbl = Gtk.Label(label="Port:")
+        self.mb_local_row.pack_start(mb_port_lbl, False, False, 0)
+
+        self.spin_mb_local_port = Gtk.SpinButton.new_with_range(1, 65535, 1)
+        self.spin_mb_local_port.set_numeric(True)
+        self.spin_mb_local_port.set_value(
+            normalize_mb_local_port(getattr(self.settings, "mb_local_port", DEFAULT_MB_LOCAL_PORT))
         )
-        tab4.pack_start(self.entry_mb_server_url, False, False, 0)
+        self.spin_mb_local_port.set_tooltip_text(
+            "TCP-Port des MusicBrainz-Docker-Containers (Standard bei musicbrainz-docker: 5000)."
+        )
+        self.spin_mb_local_port.connect("value-changed", self._on_mb_mirror_settings_changed)
+        self.mb_local_row.pack_start(self.spin_mb_local_port, False, False, 0)
+
+        self.btn_test_mb_connection = Gtk.Button(label="Verbindung testen")
+        self.btn_test_mb_connection.set_tooltip_text(
+            "Prüft sofort die Erreichbarkeit und Antwortzeit des eingestellten MusicBrainz-Servers."
+        )
+        self.btn_test_mb_connection.connect("clicked", self._on_test_mb_connection_clicked)
+        self.mb_local_row.pack_start(self.btn_test_mb_connection, False, False, 0)
+        tab4.pack_start(self.mb_local_row, False, False, 0)
+
+        self.check_mb_fallback_official = Gtk.CheckButton(
+            label="Bei Nichterreichbarkeit automatisch auf offizielle MusicBrainz-Server (musicbrainz.org) ausweichen"
+        )
+        self.check_mb_fallback_official.set_margin_start(22)
+        self.check_mb_fallback_official.set_active(
+            bool(getattr(self.settings, "mb_fallback_to_official", True))
+        )
+        self.check_mb_fallback_official.set_tooltip_text(
+            "Wenn der lokale Docker-Container gestoppt oder nicht erreichbar ist, wechselt MintRip Studio automatisch ohne Wartezeit auf https://musicbrainz.org/ws/2."
+        )
+        self.check_mb_fallback_official.connect("toggled", self._on_mb_mirror_settings_changed)
+        tab4.pack_start(self.check_mb_fallback_official, False, False, 0)
+
+        self.mb_server_status_label = Gtk.Label()
+        self.mb_server_status_label.set_xalign(0)
+        self.mb_server_status_label.set_line_wrap(True)
+        self.mb_server_status_label.set_margin_start(22)
+        self.mb_server_status_label.get_style_context().add_class("dim-label")
+        tab4.pack_start(self.mb_server_status_label, False, False, 0)
+        self._update_mb_mirror_ui_state()
 
         self.check_prefer_subgenres = Gtk.CheckButton(
             label="Spezifische Subgenres bevorzugen (Verallgemeinerungen wie „Rock“/„Punk“ ausblenden, sobald Subgenres vorliegen)"
@@ -1327,12 +1410,23 @@ class SettingsPanel(Gtk.Box):
         self.entry_discogs_token.set_text(settings.discogs_token)
         if hasattr(self, "entry_lastfm_api_key"):
             self.entry_lastfm_api_key.set_text(str(getattr(settings, "lastfm_api_key", "") or ""))
-        if hasattr(self, "entry_mb_server_url"):
-            self.entry_mb_server_url.set_text(
-                normalize_musicbrainz_server_url(
-                    getattr(settings, "musicbrainz_server_url", DEFAULT_MUSICBRAINZ_SERVER_URL)
-                )
+        if hasattr(self, "check_mb_use_local_mirror"):
+            self.check_mb_use_local_mirror.set_active(
+                bool(getattr(settings, "mb_use_local_mirror", False))
             )
+        if hasattr(self, "entry_mb_local_host"):
+            self.entry_mb_local_host.set_text(
+                normalize_mb_local_host(getattr(settings, "mb_local_host", DEFAULT_MB_LOCAL_HOST))
+            )
+        if hasattr(self, "spin_mb_local_port"):
+            self.spin_mb_local_port.set_value(
+                normalize_mb_local_port(getattr(settings, "mb_local_port", DEFAULT_MB_LOCAL_PORT))
+            )
+        if hasattr(self, "check_mb_fallback_official"):
+            self.check_mb_fallback_official.set_active(
+                bool(getattr(settings, "mb_fallback_to_official", True))
+            )
+        self._update_mb_mirror_ui_state()
         if hasattr(self, "check_mb_deep_relations"):
             self.check_mb_deep_relations.set_active(
                 bool(getattr(settings, "mb_load_deep_relations", False))
@@ -1453,6 +1547,75 @@ class SettingsPanel(Gtk.Box):
     def _on_clear_metadata_cache_clicked(self, _btn: Gtk.Button) -> None:
         clear_metadata_cache()
         self._refresh_cache_stats_label()
+
+    def _get_effective_mb_url_from_widgets(self) -> str:
+        use_local = bool(getattr(self, "check_mb_use_local_mirror", None) and self.check_mb_use_local_mirror.get_active())
+        host = self.entry_mb_local_host.get_text() if hasattr(self, "entry_mb_local_host") else DEFAULT_MB_LOCAL_HOST
+        port = self.spin_mb_local_port.get_value_as_int() if hasattr(self, "spin_mb_local_port") else DEFAULT_MB_LOCAL_PORT
+        return build_musicbrainz_server_url(use_local, host, port)
+
+    def _update_mb_mirror_ui_state(self, status_override: str | None = None) -> None:
+        if not hasattr(self, "check_mb_use_local_mirror"):
+            return
+        use_local = self.check_mb_use_local_mirror.get_active()
+        if hasattr(self, "entry_mb_local_host"):
+            self.entry_mb_local_host.set_sensitive(use_local)
+        if hasattr(self, "spin_mb_local_port"):
+            self.spin_mb_local_port.set_sensitive(use_local)
+        if hasattr(self, "check_mb_fallback_official"):
+            self.check_mb_fallback_official.set_sensitive(use_local)
+        if hasattr(self, "mb_server_status_label"):
+            if status_override is not None:
+                self.mb_server_status_label.set_markup(status_override)
+            else:
+                eff_url = self._get_effective_mb_url_from_widgets()
+                if use_local:
+                    fb_txt = (
+                        " · automatischer Fallback auf musicbrainz.org aktiv"
+                        if self.check_mb_fallback_official.get_active()
+                        else " · Fallback deaktiviert"
+                    )
+                    self.mb_server_status_label.set_markup(
+                        f"Aktiver Endpunkt: <tt>{GLib.markup_escape_text(eff_url)}</tt>{GLib.markup_escape_text(fb_txt)}"
+                    )
+                else:
+                    self.mb_server_status_label.set_markup(
+                        f"Aktiver Endpunkt: <tt>{GLib.markup_escape_text(DEFAULT_MUSICBRAINZ_SERVER_URL)}</tt> (offizielle MusicBrainz-Server)"
+                    )
+
+    def _on_mb_mirror_settings_changed(self, *_args) -> None:
+        self._update_mb_mirror_ui_state()
+
+    def _on_test_mb_connection_clicked(self, _btn: Gtk.Button) -> None:
+        target_url = self._get_effective_mb_url_from_widgets()
+        self.btn_test_mb_connection.set_sensitive(False)
+        self._update_mb_mirror_ui_state(
+            f"Prüfe Verbindung zu <tt>{GLib.markup_escape_text(target_url)}</tt>…"
+        )
+
+        def _worker() -> None:
+            ok, _ms, msg = test_musicbrainz_connection(target_url, timeout=4.0)
+            use_local = self.check_mb_use_local_mirror.get_active()
+            fb_active = self.check_mb_fallback_official.get_active()
+            if ok:
+                markup = f"<span foreground='#2e7d32'><b>✓ {GLib.markup_escape_text(msg)}</b></span> (<tt>{GLib.markup_escape_text(target_url)}</tt>)"
+            else:
+                fb_hint = (
+                    " – Ausweichen auf musicbrainz.org ist aktiv."
+                    if use_local and fb_active
+                    else ""
+                )
+                markup = f"<span foreground='#c62828'><b>✗ {GLib.markup_escape_text(msg)}</b></span>{GLib.markup_escape_text(fb_hint)}"
+
+            def _apply_result() -> bool:
+                if hasattr(self, "btn_test_mb_connection"):
+                    self.btn_test_mb_connection.set_sensitive(True)
+                self._update_mb_mirror_ui_state(markup)
+                return False
+
+            GLib.idle_add(_apply_result)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _section_title(self, text: str) -> Gtk.Label:
         lbl = Gtk.Label()
@@ -1675,10 +1838,20 @@ class SettingsPanel(Gtk.Box):
         self.settings.discogs_token = self.entry_discogs_token.get_text().strip()
         if hasattr(self, "entry_lastfm_api_key"):
             self.settings.lastfm_api_key = self.entry_lastfm_api_key.get_text().strip()
-        if hasattr(self, "entry_mb_server_url"):
-            self.settings.musicbrainz_server_url = normalize_musicbrainz_server_url(
-                self.entry_mb_server_url.get_text()
-            )
+        if hasattr(self, "check_mb_use_local_mirror"):
+            self.settings.mb_use_local_mirror = self.check_mb_use_local_mirror.get_active()
+        if hasattr(self, "entry_mb_local_host"):
+            self.settings.mb_local_host = normalize_mb_local_host(self.entry_mb_local_host.get_text())
+        if hasattr(self, "spin_mb_local_port"):
+            self.settings.mb_local_port = normalize_mb_local_port(self.spin_mb_local_port.get_value_as_int())
+        if hasattr(self, "check_mb_fallback_official"):
+            self.settings.mb_fallback_to_official = self.check_mb_fallback_official.get_active()
+        self.settings.musicbrainz_server_url = build_musicbrainz_server_url(
+            self.settings.mb_use_local_mirror,
+            self.settings.mb_local_host,
+            self.settings.mb_local_port,
+        )
+        reset_musicbrainz_mirror_cooldown()
         if hasattr(self, "check_mb_deep_relations"):
             self.settings.mb_load_deep_relations = self.check_mb_deep_relations.get_active()
         if hasattr(self, "check_prefer_subgenres"):

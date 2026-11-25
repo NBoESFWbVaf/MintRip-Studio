@@ -127,6 +127,7 @@ interface MetadataWorkbenchProps {
   onOpenCoverPicker?: () => void;
   isFilenameToTagsOpen?: boolean;
   onCloseFilenameToTags?: () => void;
+  onDbPreviewProgress?: (state: 'start' | 'done' | 'dismiss', label?: string) => void;
 }
 
 const SAMPLE_BARCODE_PRESETS = [
@@ -221,6 +222,7 @@ export function MetadataWorkbench({
   onOpenCoverPicker,
   isFilenameToTagsOpen = false,
   onCloseFilenameToTags,
+  onDbPreviewProgress,
 }: MetadataWorkbenchProps) {
   const [isCoverDragOver, setIsCoverDragOver] = useState(false);
   const [isHitsDropActive, setIsHitsDropActive] = useState(false);
@@ -472,6 +474,15 @@ export function MetadataWorkbench({
     if (settings.discogsToken?.trim()) {
       headers['x-discogs-token'] = settings.discogsToken.trim();
     }
+    const previewLabel = [selectedHitCandidate.artist, selectedHitCandidate.title]
+      .filter((s) => Boolean(s && s.trim()))
+      .join(' – ');
+    onDbPreviewProgress?.(
+      'start',
+      previewLabel
+        ? `Album-Vorschau wird geladen… (${previewLabel})`
+        : 'Album-Vorschau wird geladen…'
+    );
 
     fetch(`/api/metadata/preview-tracks?${params.toString()}`, {
       headers,
@@ -511,6 +522,12 @@ export function MetadataWorkbench({
           error: null,
           ...normalized,
         });
+        onDbPreviewProgress?.(
+          'done',
+          previewLabel
+            ? `Album-Vorschau geladen: ${previewLabel}`
+            : 'Album-Vorschau geladen'
+        );
       })
       .catch((err: any) => {
         if (controller.signal.aborted) return;
@@ -521,12 +538,14 @@ export function MetadataWorkbench({
           ...baseFields,
           tracks: [],
         });
+        onDbPreviewProgress?.('done', 'Album-Vorschau nicht verfügbar');
       });
 
     return () => {
       controller.abort();
+      onDbPreviewProgress?.('dismiss');
     };
-  }, [isAlbumPreviewMode, selectedHitPreviewKey, settings.discogsToken]);
+  }, [isAlbumPreviewMode, selectedHitPreviewKey, settings.discogsToken, onDbPreviewProgress]);
 
   useEffect(() => {
     setCoverImgFailed(false);
@@ -4902,6 +4921,32 @@ export function MetadataWorkbench({
                   </div>
                 </div>
               )}
+              {moduleMode === 'album_tag' &&
+                isHitsDropActive &&
+                !isSearching &&
+                !isLoadingRelease &&
+                !isRetryingBackoff && (
+                  <div
+                    aria-hidden="true"
+                    className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-[#5BA632]/12 dark:bg-[#5BA632]/18 backdrop-blur-[1.5px] border-2 border-dashed border-[#5BA632] rounded-b-lg p-4"
+                  >
+                    <div className="flex flex-col items-center gap-2 px-6 py-4 rounded-xl bg-white/92 dark:bg-[#1C1F23]/92 border border-[#5BA632]/45 shadow-md text-center">
+                      <div className="w-12 h-12 rounded-full bg-[#5BA632]/15 flex items-center justify-center text-[#5BA632] dark:text-[#6BCB57]">
+                        <svg viewBox="0 0 24 24" className="w-7 h-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 4v11" />
+                          <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+                          <path d="M4 15v2.5A2.5 2.5 0 0 0 6.5 20h11a2.5 2.5 0 0 0 2.5-2.5V15" />
+                        </svg>
+                      </div>
+                      <p className="text-sm font-semibold text-[#1F2328] dark:text-[#EAEEF2]">
+                        Album-Ordner hier ablegen
+                      </p>
+                      <p className="text-xs text-[#57606A] dark:text-[#8B949E]">
+                        Aktuelle Liste wird geleert &amp; Online-Abfrage gestartet
+                      </p>
+                    </div>
+                  </div>
+                )}
               <fieldset disabled={isBatchActivelyRunning} className="min-w-0 block">
                 {searchResults.length === 0 ? (
                   <div className="p-8 min-h-[210px] flex flex-col items-center justify-center text-center space-y-2 bg-white dark:bg-[#25292E]">
@@ -5158,6 +5203,7 @@ export function MetadataWorkbench({
                   onImportAudioFiles(droppedFiles, {
                     replaceExisting: true,
                     autoLookupToc: false,
+                    resetBeforeImport: moduleMode === 'album_tag',
                   });
                 }
               });
@@ -5201,7 +5247,29 @@ export function MetadataWorkbench({
           </summary>
 
           {activeRightDisplay === 'tracks' && (
-            <div className="bg-[#FAFAFA] dark:bg-[#1C1F23]/40">
+            <div className="relative bg-[#FAFAFA] dark:bg-[#1C1F23]/40">
+              {moduleMode === 'album_tag' && isTrackDropActive && (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-[#5BA632]/12 dark:bg-[#5BA632]/18 backdrop-blur-[1.5px] border-2 border-dashed border-[#5BA632] rounded-b-lg p-4"
+                >
+                  <div className="flex flex-col items-center gap-2 px-6 py-4 rounded-xl bg-white/92 dark:bg-[#1C1F23]/92 border border-[#5BA632]/45 shadow-md text-center">
+                    <div className="w-12 h-12 rounded-full bg-[#5BA632]/15 flex items-center justify-center text-[#5BA632] dark:text-[#6BCB57]">
+                      <svg viewBox="0 0 24 24" className="w-7 h-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 4v11" />
+                        <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+                        <path d="M4 15v2.5A2.5 2.5 0 0 0 6.5 20h11a2.5 2.5 0 0 0 2.5-2.5V15" />
+                      </svg>
+                    </div>
+                    <p className="text-sm font-semibold text-[#1F2328] dark:text-[#EAEEF2]">
+                      Album-Ordner hier ablegen
+                    </p>
+                    <p className="text-xs text-[#57606A] dark:text-[#8B949E]">
+                      Aktuelle Liste wird geleert &amp; Titel werden geladen
+                    </p>
+                  </div>
+                </div>
+              )}
               <fieldset
                 disabled={isBatchActivelyRunning}
                 className={`min-w-0 block ${

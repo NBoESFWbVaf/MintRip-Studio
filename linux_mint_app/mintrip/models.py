@@ -1281,6 +1281,89 @@ DEFAULT_OUTPUT_DIR_CUT: Path = Path.home() / "Musik" / "06_geschnitten"
 
 
 DEFAULT_MUSICBRAINZ_SERVER_URL: str = "https://musicbrainz.org/ws/2"
+DEFAULT_MB_LOCAL_HOST: str = "localhost"
+DEFAULT_MB_LOCAL_PORT: int = 5000
+
+
+def normalize_mb_local_host(raw_value: object) -> str:
+    """Normalisiert Hostname/IP für einen lokalen MusicBrainz-Docker-Mirror (Standard: localhost)."""
+    val = str(raw_value or "").strip()
+    if not val:
+        return DEFAULT_MB_LOCAL_HOST
+    # Sicherheits- & Eingabevalidierung: keine Steuerzeichen, Leerzeichen oder Zugangsdaten
+    if any(ch.isspace() for ch in val) or "@" in val or "?" in val or "#" in val:
+        return DEFAULT_MB_LOCAL_HOST
+    scheme = ""
+    lower = val.lower()
+    if lower.startswith("https://"):
+        scheme = "https://"
+        val = val[8:]
+    elif lower.startswith("http://"):
+        scheme = ""
+        val = val[7:]
+    val = val.split("/", 1)[0].strip()
+    if not val:
+        return DEFAULT_MB_LOCAL_HOST
+    # Optionalen :Port am Host abtrennen (außer reine IPv6-Adresse in [..])
+    if val.startswith("["):
+        end_idx = val.find("]")
+        if end_idx > 0:
+            val = val[: end_idx + 1]
+    elif ":" in val:
+        host_part, port_part = val.rsplit(":", 1)
+        if host_part and port_part.isdigit():
+            val = host_part
+    if not val:
+        return DEFAULT_MB_LOCAL_HOST
+    return f"{scheme}{val}"
+
+
+def normalize_mb_local_port(raw_value: object) -> int:
+    """Validiert den TCP-Port (1..65535) für einen lokalen MusicBrainz-Docker-Mirror (Standard: 5000)."""
+    try:
+        port = int(round(float(raw_value)))
+    except Exception:
+        return DEFAULT_MB_LOCAL_PORT
+    if 1 <= port <= 65535:
+        return port
+    return DEFAULT_MB_LOCAL_PORT
+
+
+def build_musicbrainz_server_url(
+    use_local_mirror: bool,
+    local_host: object = DEFAULT_MB_LOCAL_HOST,
+    local_port: object = DEFAULT_MB_LOCAL_PORT,
+) -> str:
+    """Erzeugt die effektive MusicBrainz-WS2-Basis-URL aus Modus, Host und Port."""
+    if not use_local_mirror:
+        return DEFAULT_MUSICBRAINZ_SERVER_URL
+    host = normalize_mb_local_host(local_host)
+    port = normalize_mb_local_port(local_port)
+    if host.lower().startswith("https://"):
+        scheme = "https"
+        bare_host = host[8:]
+    else:
+        scheme = "http"
+        bare_host = host
+    return f"{scheme}://{bare_host}:{port}/ws/2"
+
+
+def parse_musicbrainz_local_host_port(server_url: object) -> tuple[bool, str, int]:
+    """Extrahiert (use_local_mirror, host, port) aus einer bestehenden MusicBrainz-Server-URL."""
+    norm = normalize_musicbrainz_server_url(server_url)
+    if norm == DEFAULT_MUSICBRAINZ_SERVER_URL:
+        return False, DEFAULT_MB_LOCAL_HOST, DEFAULT_MB_LOCAL_PORT
+    from urllib.parse import urlparse
+
+    parsed = urlparse(norm)
+    hostname = (parsed.hostname or "").strip()
+    if not hostname or hostname.lower() == "musicbrainz.org" or hostname.lower().endswith(".musicbrainz.org"):
+        return False, DEFAULT_MB_LOCAL_HOST, DEFAULT_MB_LOCAL_PORT
+    host_display = f"[{hostname}]" if ":" in hostname else hostname
+    if parsed.scheme == "https":
+        host_display = f"https://{host_display}"
+    port = parsed.port or (443 if parsed.scheme == "https" else DEFAULT_MB_LOCAL_PORT)
+    return True, normalize_mb_local_host(host_display), normalize_mb_local_port(port)
 
 
 def normalize_musicbrainz_server_url(raw_value: object) -> str:
@@ -1326,6 +1409,10 @@ class ExportSettings:
     discogs_token: str = ""
     lastfm_api_key: str = ""
     musicbrainz_server_url: str = DEFAULT_MUSICBRAINZ_SERVER_URL
+    mb_use_local_mirror: bool = False
+    mb_local_host: str = DEFAULT_MB_LOCAL_HOST
+    mb_local_port: int = DEFAULT_MB_LOCAL_PORT
+    mb_fallback_to_official: bool = True
     mb_load_deep_relations: bool = False
     prefer_subgenres: bool = True
     auto_enrich_track_genres: bool = True

@@ -39,9 +39,24 @@ def _paths_from_uris(uris: list[str]) -> list[Path]:
     return paths
 
 
+def _is_external_uri_drag(drag_context: Gdk.DragContext) -> bool:
+    """Prüft, ob ein laufender Drag-Vorgang externe Dateien/Ordner (text/uri-list) und keine interne Track-Sortierung enthält."""
+    try:
+        targets = drag_context.list_targets() or []
+        names = [t.name() for t in targets if hasattr(t, "name")]
+        if "mintrip-track-index" in names and "text/uri-list" not in names:
+            return False
+        if names:
+            return "text/uri-list" in names
+    except Exception:
+        pass
+    return True
+
+
 def attach_audio_file_drop_target(
     widget: Gtk.Widget,
     on_files_dropped: Callable[[list[Path]], None],
+    on_drag_hover: Callable[[bool], None] | None = None,
 ) -> None:
     """Ermöglicht das Ablegen von Audiodateien oder Ordnern (inkl. Unterordnern) per Drag-and-Drop."""
     if isinstance(widget, Gtk.TreeView):
@@ -50,6 +65,28 @@ def attach_audio_file_drop_target(
     else:
         widget.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
         widget.drag_dest_add_uri_targets()
+
+    if on_drag_hover is not None:
+        def _on_drag_motion(
+            _w: Gtk.Widget,
+            drag_context: Gdk.DragContext,
+            _x: int,
+            _y: int,
+            _time_val: int,
+        ) -> bool:
+            if _is_external_uri_drag(drag_context):
+                on_drag_hover(True)
+            return False
+
+        def _on_drag_leave(
+            _w: Gtk.Widget,
+            _drag_context: Gdk.DragContext,
+            _time_val: int,
+        ) -> None:
+            on_drag_hover(False)
+
+        widget.connect("drag-motion", _on_drag_motion)
+        widget.connect("drag-leave", _on_drag_leave)
 
     def _on_data_received(
         _widget: Gtk.Widget,
@@ -60,6 +97,8 @@ def attach_audio_file_drop_target(
         _info: int,
         time_val: int,
     ) -> None:
+        if on_drag_hover is not None:
+            on_drag_hover(False)
         uris = selection_data.get_uris() or []
         collected: list[Path] = []
         for path in _paths_from_uris(uris):

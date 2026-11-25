@@ -18,10 +18,110 @@ const METADATA_CACHE_MAX_ENTRIES = 2500;
 
 interface RequestMetaContext {
   mbBaseUrl: string;
+  mbFallbackToOfficial: boolean;
   preferSubgenres: boolean;
 }
 
 const requestMetaContext = new AsyncLocalStorage<RequestMetaContext>();
+let mbMirrorUnreachableUntil = 0;
+let mbMirrorUnreachableUrl = '';
+// Key: `${baseUrl}|${entity}` -> { empty: boolean; expiresAt: number }
+const mbMirrorSolrStatus = new Map<string, { empty: boolean; expiresAt: number }>();
+
+type MbSearchEntity = 'recording' | 'release' | 'release-group' | 'artist';
+const MB_SOLR_SEARCH_ENTITIES: Record<MbSearchEntity, { probePath: string; listKey: string }> = {
+  recording: { probePath: 'recording/?query=Yesterday&limit=1&fmt=json', listKey: 'recordings' },
+  release: { probePath: 'release/?query=Nevermind&limit=1&fmt=json', listKey: 'releases' },
+  'release-group': { probePath: 'release-group/?query=Nevermind&limit=1&fmt=json', listKey: 'release-groups' },
+  artist: { probePath: 'artist/?query=Nirvana&limit=1&fmt=json', listKey: 'artists' },
+};
+
+function detectMbSearchEntity(urlStr: string): MbSearchEntity | null {
+  try {
+    const parsed = new URL(urlStr);
+    const lowerPath = parsed.pathname.toLowerCase();
+    const ws2Idx = lowerPath.indexOf('/ws/2/');
+    if (ws2Idx < 0 || !parsed.searchParams.has('query')) return null;
+    const rel = lowerPath.slice(ws2Idx + 6).replace(/\/+$/, '');
+    if (rel === 'recording' || rel === 'release' || rel === 'release-group' || rel === 'artist') {
+      return rel;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function isEmptyMbSearchJson(entity: MbSearchEntity, bodyText: string): boolean {
+  try {
+    const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return false;
+    const listKey = MB_SOLR_SEARCH_ENTITIES[entity].listKey;
+    const items = parsed[listKey];
+    const count = parsed.count;
+    return Array.isArray(items) && items.length === 0 && (count === undefined || Number(count || 0) === 0);
+  } catch {
+    return false;
+  }
+}
+
+async function probeLocalMirrorSolrEntity(
+  baseUrl: string,
+  entity: MbSearchEntity,
+  timeoutMs = 3000
+): Promise<boolean> {
+  const { probePath, listKey } = MB_SOLR_SEARCH_ENTITIES[entity];
+  try {
+    const resp = await fetch(`${baseUrl}/${probePath}`, {
+      headers: { 'User-Agent': MB_USER_AGENT, Accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) return false;
+    const data = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!data) return false;
+    const items = data[listKey];
+    if (Array.isArray(items) && items.length > 0) return true;
+    return Number(data.count || 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeMbHostInput(raw: unknown): string {
+  let val = String(raw || '').trim();
+  if (!val) return 'localhost';
+  if (/\s/.test(val) || val.includes('@') || val.includes('?') || val.includes('#')) {
+    return 'localhost';
+  }
+  let scheme = '';
+  const lower = val.toLowerCase();
+  if (lower.startsWith('https://')) {
+    scheme = 'https://';
+    val = val.slice(8);
+  } else if (lower.startsWith('http://')) {
+    val = val.slice(7);
+  }
+  val = val.split('/', 1)[0].trim();
+  if (!val) return 'localhost';
+  if (val.startsWith('[')) {
+    const endIdx = val.indexOf(']');
+    if (endIdx > 0) val = val.slice(0, endIdx + 1);
+  } else if (val.includes(':')) {
+    const idx = val.lastIndexOf(':');
+    const hostPart = val.slice(0, idx);
+    const portPart = val.slice(idx + 1);
+    if (hostPart && /^\d+$/.test(portPart)) {
+      val = hostPart;
+    }
+  }
+  return val ? `${scheme}${val}` : 'localhost';
+}
+
+function normalizeMbPortInput(raw: unknown): number {
+  const port = Number.parseInt(String(raw ?? ''), 10);
+  if (Number.isFinite(port) && port >= 1 && port <= 65535) return port;
+  return 5000;
+}
 
 function normalizeMusicBrainzServerUrl(raw: unknown): string {
   const txt = String(raw || '').trim().replace(/\/+$/, '');
@@ -139,6 +239,11 @@ function makeCacheKey(urlStr: string): string {
     // API-Keys aus Cache-Key entfernen, damit identische Abfragen auch ohne Key-Duplikat treffen
     if (parsed.searchParams.has('api_key')) {
       parsed.searchParams.delete('api_key');
+    }
+    // Kanonischer Cache-Key für MusicBrainz-WS2, damit lokaler Docker-Mirror & musicbrainz.org den Cache teilen
+    const ws2Idx = parsed.pathname.toLowerCase().indexOf('/ws/2/');
+    if (ws2Idx >= 0) {
+      return `https://musicbrainz.org${parsed.pathname.slice(ws2Idx)}${parsed.search}`;
     }
     return parsed.toString();
   } catch {
@@ -979,17 +1084,117 @@ async function fetchWithExponentialBackoff(
   onLogLine?: (line: string) => void,
   waitOnCircuit = false
 ): Promise<Response> {
-  const effectiveUrl = rewriteMusicBrainzUrl(url);
+  const ctx = requestMetaContext.getStore();
+  const rewrittenUrl = rewriteMusicBrainzUrl(url);
+  const searchEntity = detectMbSearchEntity(rewrittenUrl);
+  const isLocalMirrorRequest =
+    url.startsWith(DEFAULT_MUSICBRAINZ_SERVER_URL) &&
+    rewrittenUrl !== url &&
+    !isOfficialMusicBrainzUrl(rewrittenUrl);
+  const fallbackToOfficial = ctx?.mbFallbackToOfficial !== false;
+
   const method = String(options.method || 'GET').toUpperCase();
-  const ttlMs = method === 'GET' ? getCacheTtlMsForUrl(effectiveUrl) : 0;
+  const ttlMs = method === 'GET' ? getCacheTtlMsForUrl(rewrittenUrl) : 0;
 
   if (ttlMs > 0) {
-    const cachedBody = readMetadataCache(effectiveUrl);
+    const cachedBody = readMetadataCache(rewrittenUrl);
     if (cachedBody !== null) {
-      return new Response(cachedBody, {
-        status: 200,
-        headers: { 'content-type': 'application/json; charset=utf-8', 'x-mintrip-cache': 'HIT' },
-      });
+      if (!(searchEntity && isEmptyMbSearchJson(searchEntity, cachedBody))) {
+        return new Response(cachedBody, {
+          status: 200,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'x-mintrip-cache': 'HIT' },
+        });
+      }
+    }
+  }
+
+  const pushMsg = (msg: string) => {
+    const formatted = formatLogLine(msg);
+    logs?.push(formatted);
+    onLogLine?.(formatted);
+  };
+
+  let effectiveUrl = rewrittenUrl;
+  if (isLocalMirrorRequest && fallbackToOfficial) {
+    const configuredBase = ctx?.mbBaseUrl || '';
+    const signal = options.signal as AbortSignal | undefined;
+    const solrKey = searchEntity ? `${configuredBase}|${searchEntity}` : '';
+    const solrCached = solrKey ? mbMirrorSolrStatus.get(solrKey) : undefined;
+    const nowMs = Date.now();
+
+    if (mbMirrorUnreachableUrl === configuredBase && nowMs < mbMirrorUnreachableUntil) {
+      effectiveUrl = url;
+    } else if (searchEntity && solrCached && nowMs < solrCached.expiresAt && solrCached.empty) {
+      // Bekanntermaßen leerer lokaler Solr-Core -> Freitextsuche direkt an musicbrainz.org senden
+      effectiveUrl = url;
+    } else {
+      try {
+        const mirrorTimeout = AbortSignal.timeout(4000);
+        const mirrorSignal = signal ? AbortSignal.any([signal, mirrorTimeout]) : mirrorTimeout;
+        const mirrorResp = await fetch(rewrittenUrl, {
+          ...options,
+          signal: mirrorSignal,
+        });
+        if (![500, 502, 503, 504].includes(mirrorResp.status)) {
+          if (mirrorResp.ok) {
+            const bodyText = await mirrorResp.text();
+            if (searchEntity && isEmptyMbSearchJson(searchEntity, bodyText)) {
+              const knownPopulated = Boolean(solrCached && nowMs < solrCached.expiresAt && !solrCached.empty);
+              if (!knownPopulated) {
+                const hasSolrData = await probeLocalMirrorSolrEntity(configuredBase, searchEntity, 2500);
+                mbMirrorSolrStatus.set(solrKey, { empty: !hasSolrData, expiresAt: Date.now() + 600_000 });
+                if (!hasSolrData) {
+                  pushMsg(
+                    `${label}: Lokaler Mirror (${configuredBase}): Solr-Suchindex für „${searchEntity}“ ist leer – weiche für ${searchEntity}-Freitextsuchen automatisch auf musicbrainz.org aus (Direktabrufe per MBID/ISRC/DiscID laufen weiter lokal).`
+                  );
+                  effectiveUrl = url;
+                } else {
+                  return new Response(bodyText, {
+                    status: mirrorResp.status,
+                    statusText: mirrorResp.statusText,
+                    headers: mirrorResp.headers,
+                  });
+                }
+              } else {
+                return new Response(bodyText, {
+                  status: mirrorResp.status,
+                  statusText: mirrorResp.statusText,
+                  headers: mirrorResp.headers,
+                });
+              }
+            } else {
+              if (ttlMs > 0 && (bodyText.trim().startsWith('{') || bodyText.trim().startsWith('['))) {
+                writeMetadataCache(rewrittenUrl, bodyText, ttlMs);
+              }
+              return new Response(bodyText, {
+                status: mirrorResp.status,
+                statusText: mirrorResp.statusText,
+                headers: mirrorResp.headers,
+              });
+            }
+          } else {
+            return mirrorResp;
+          }
+        } else {
+          mbMirrorUnreachableUrl = configuredBase;
+          mbMirrorUnreachableUntil = Date.now() + 30_000;
+          pushMsg(
+            `${label}: Lokaler Mirror (${configuredBase}) meldete HTTP ${mirrorResp.status} – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.`
+          );
+          effectiveUrl = url;
+        }
+      } catch (mirrorErr) {
+        if (signal?.aborted) {
+          throw mirrorErr;
+        }
+        mbMirrorUnreachableUrl = configuredBase;
+        mbMirrorUnreachableUntil = Date.now() + 30_000;
+        const reason = mirrorErr instanceof Error ? mirrorErr.message : String(mirrorErr);
+        pushMsg(
+          `${label}: Lokaler Mirror (${configuredBase}) nicht erreichbar (${reason}) – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.`
+        );
+        effectiveUrl = url;
+      }
     }
   }
 
@@ -997,12 +1202,6 @@ async function fetchWithExponentialBackoff(
   const effectiveMaxRetries = isOfficialMb ? Math.min(2, maxRetries) : Math.min(3, maxRetries);
   const signal = options.signal as AbortSignal | undefined;
   let lastError: Error | null = null;
-
-  const pushMsg = (msg: string) => {
-    const formatted = formatLogLine(msg);
-    logs?.push(formatted);
-    onLogLine?.(formatted);
-  };
 
   if (isOfficialMb) {
     const nowMs = Date.now();
@@ -2881,16 +3080,115 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
-  // Per-Request-Kontext für konfigurierbare MusicBrainz-Server-URL & Subgenre-Präferenz
+  // Per-Request-Kontext für konfigurierbare MusicBrainz-Server-URL, Fallback & Subgenre-Präferenz
   app.use('/api', (req, _res, next) => {
     const mbBaseUrl = normalizeMusicBrainzServerUrl(
       req.headers['x-mb-server-url'] || req.query.mbServerUrl
     );
+    const rawFallback = String(req.headers['x-mb-fallback-official'] ?? req.query.mbFallbackOfficial ?? 'true')
+      .trim()
+      .toLowerCase();
+    const mbFallbackToOfficial = rawFallback !== 'false' && rawFallback !== '0';
     const rawPrefer = String(req.headers['x-prefer-subgenres'] ?? req.query.preferSubgenres ?? 'true')
       .trim()
       .toLowerCase();
     const preferSubgenres = rawPrefer !== 'false' && rawPrefer !== '0';
-    requestMetaContext.run({ mbBaseUrl, preferSubgenres }, next);
+    requestMetaContext.run({ mbBaseUrl, mbFallbackToOfficial, preferSubgenres }, next);
+  });
+
+  // Verbindungstest für lokalen MusicBrainz-Docker-Container oder offizielle Server
+  app.post('/api/musicbrainz/test-connection', async (req, res) => {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const useLocalMirror = Boolean(body.useLocalMirror);
+    let targetBase = DEFAULT_MUSICBRAINZ_SERVER_URL;
+    if (useLocalMirror) {
+      const host = normalizeMbHostInput(body.host);
+      const port = normalizeMbPortInput(body.port);
+      const rawUrl = host.toLowerCase().startsWith('https://')
+        ? `https://${host.slice(8)}:${port}/ws/2`
+        : `http://${host}:${port}/ws/2`;
+      targetBase = normalizeMusicBrainzServerUrl(rawUrl);
+    }
+    const probeUrl = `${targetBase}/artist/5b11f4ce-a62d-471e-81fc-a69a8278c7da?fmt=json`;
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(probeUrl, {
+        headers: { 'User-Agent': MB_USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(4000),
+      });
+      const elapsedMs = Math.max(1, Date.now() - t0);
+      if (!resp.ok) {
+        return res.json({
+          ok: false,
+          url: targetBase,
+          elapsedMs,
+          status: resp.status,
+          message: `HTTP ${resp.status}: ${resp.statusText || 'Fehler'}`,
+        });
+      }
+      const data = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+      if (data && typeof data.id === 'string') {
+        if (!isOfficialMusicBrainzUrl(targetBase)) {
+          mbMirrorUnreachableUntil = 0;
+          mbMirrorUnreachableUrl = '';
+          mbMirrorSolrStatus.clear();
+          const [relOk, recOk] = await Promise.all([
+            probeLocalMirrorSolrEntity(targetBase, 'release', 3000),
+            probeLocalMirrorSolrEntity(targetBase, 'recording', 3000),
+          ]);
+          const expiresAt = Date.now() + 600_000;
+          mbMirrorSolrStatus.set(`${targetBase}|release`, { empty: !relOk, expiresAt });
+          mbMirrorSolrStatus.set(`${targetBase}|recording`, { empty: !recOk, expiresAt });
+          if (relOk && recOk) {
+            return res.json({
+              ok: true,
+              url: targetBase,
+              elapsedMs,
+              status: resp.status,
+              solrReleaseOk: true,
+              solrRecordingOk: true,
+              message: `Datenbank OK (${elapsedMs} ms) · Solr-Suchindex (Release & Recording) aktiv – kein Rate-Limit`,
+            });
+          }
+          const emptyParts: string[] = [];
+          if (!relOk) emptyParts.push('Release');
+          if (!recOk) emptyParts.push('Recording');
+          return res.json({
+            ok: true,
+            url: targetBase,
+            elapsedMs,
+            status: resp.status,
+            solrReleaseOk: relOk,
+            solrRecordingOk: recOk,
+            message: `Datenbank OK (${elapsedMs} ms) · ⚠ Solr-Suchindex (${emptyParts.join(' & ')}) leer – Freitextsuchen weichen automatisch auf musicbrainz.org aus, Detail-/ISRC-/MBID-Abrufe laufen lokal`,
+          });
+        }
+        return res.json({
+          ok: true,
+          url: targetBase,
+          elapsedMs,
+          status: resp.status,
+          message: `Verbunden mit musicbrainz.org (${elapsedMs} ms)`,
+        });
+      }
+      return res.json({
+        ok: false,
+        url: targetBase,
+        elapsedMs,
+        status: resp.status,
+        message: 'Unerwartete Antwort (keine gültige MusicBrainz-WS2-JSON-Antwort)',
+      });
+    } catch (err) {
+      const elapsedMs = Math.max(1, Date.now() - t0);
+      const msg = err instanceof Error ? err.message : String(err);
+      return res.json({
+        ok: false,
+        url: targetBase,
+        elapsedMs,
+        status: 0,
+        message: `Nicht erreichbar (${msg})`,
+      });
+    }
   });
 
   // Metadaten-Cache-Verwaltung & Multi-Source Track-Genre-Enrichment
@@ -3272,6 +3570,7 @@ async function startServer() {
       artist?: string;
       fallbackArtist?: string;
       isrc?: string;
+      musicbrainzRecordingId?: string;
       durationSeconds?: number;
       fileName?: string;
     };
@@ -3383,11 +3682,60 @@ async function startServer() {
 
     try {
       let bestRec: any = null;
+      let mbidMatched = false;
       let isrcMatched = false;
       let matchMethod = 'MusicBrainz (Einzeltrack)';
+      const needDeepRels =
+        String(req.headers['x-mb-deep-relations'] || '').trim().toLowerCase() === 'true';
 
-      // Stufe 1: Exakter ISRC-Lookup
-      if (isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(isrc)) {
+      // Stufe 0: Direkter Recording-MBID-Abruf (läuft lokal direkt über PostgreSQL – ganz ohne Solr-Suchindex!)
+      const existingRecId = String(body.musicbrainzRecordingId || '').trim();
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(existingRecId)) {
+        logs.push(
+          formatLogLine(
+            `[MusicBrainz Einzeltrack #${trkPad}] Direktabruf per Recording-MBID ${existingRecId.slice(0, 8)}… (ohne Suchindex)...`
+          )
+        );
+        try {
+          const incStr = needDeepRels
+            ? 'artists+genres+tags+releases+release-groups+work-rels'
+            : 'artists+genres+tags+releases+release-groups';
+          const mbidResp = await fetchWithExponentialBackoff(
+            `https://musicbrainz.org/ws/2/recording/${encodeURIComponent(existingRecId)}?inc=${incStr}&fmt=json`,
+            { headers: { 'User-Agent': MB_USER_AGENT, Accept: 'application/json' } },
+            2,
+            logs,
+            'MusicBrainz Recording-MBID',
+            undefined,
+            true
+          );
+          if (mbidResp.status === 503 || mbidResp.status === 429) {
+            res.json({
+              match: null,
+              logs: [
+                ...logs,
+                formatLogLine(
+                  `[MusicBrainz Einzeltrack #${trkPad}] MusicBrainz vorübergehend überlastet (HTTP ${mbidResp.status}) – überspringe Fallback-Suche für diesen Titel.`
+                ),
+              ],
+            });
+            return;
+          }
+          if (mbidResp.ok) {
+            const mbidData = (await mbidResp.json()) as any;
+            if (mbidData && mbidData.id) {
+              bestRec = mbidData;
+              mbidMatched = true;
+              matchMethod = 'MusicBrainz (Recording-MBID)';
+            }
+          }
+        } catch {
+          bestRec = null;
+        }
+      }
+
+      // Stufe 1: Exakter ISRC-Lookup (falls vorhanden & noch kein MBID-Treffer)
+      if (!bestRec && isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(isrc)) {
         logs.push(formatLogLine(`[MusicBrainz Einzeltrack #${trkPad}] Prüfe exakten ISRC ${isrc}...`));
         try {
           const isrcResp = await fetchWithExponentialBackoff(
@@ -3511,9 +3859,7 @@ async function startServer() {
       const recId = String(bestRec?.id || '').trim();
       let detailRec = bestRec;
 
-      // Stufe 3: Recording-Details nur nachladen, falls Stufe 1 (ISRC) noch keine Genres/Artists/Releases geliefert hat oder tiefe Relationen aktiv sind
-      const needDeepRels =
-        String(req.headers['x-mb-deep-relations'] ?? 'false').trim().toLowerCase() === 'true';
+      // Stufe 3: Recording-Details nur nachladen, falls noch nicht vollständig über MBID (Stufe 0) oder ISRC (Stufe 1) geladen
       const hasIsrcDetails =
         isrcMatched &&
         Array.isArray(bestRec?.['artist-credit']) &&
@@ -3521,7 +3867,7 @@ async function startServer() {
         ((Array.isArray(bestRec?.genres) && bestRec.genres.length > 0) ||
           (Array.isArray(bestRec?.tags) && bestRec.tags.length > 0) ||
           (Array.isArray(bestRec?.releases) && bestRec.releases.length > 0));
-      if (recId && UUID_REGEX.test(recId) && (!hasIsrcDetails || needDeepRels)) {
+      if (!mbidMatched && recId && UUID_REGEX.test(recId) && (!hasIsrcDetails || needDeepRels)) {
         try {
           const incStr = needDeepRels
             ? 'artists+genres+tags+releases+release-groups+work-rels'
