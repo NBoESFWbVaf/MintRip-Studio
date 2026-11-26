@@ -18,6 +18,7 @@ const METADATA_CACHE_MAX_ENTRIES = 2500;
 
 interface RequestMetaContext {
   mbBaseUrl: string;
+  mbLocalSearchIndexEnabled: boolean;
   mbFallbackToOfficial: boolean;
   preferSubgenres: boolean;
 }
@@ -25,6 +26,7 @@ interface RequestMetaContext {
 const requestMetaContext = new AsyncLocalStorage<RequestMetaContext>();
 let mbMirrorUnreachableUntil = 0;
 let mbMirrorUnreachableUrl = '';
+let lastMbLocalSearchIndexEnabled: boolean | null = null;
 // Key: `${baseUrl}|${entity}` -> { empty: boolean; expiresAt: number }
 const mbMirrorSolrStatus = new Map<string, { empty: boolean; expiresAt: number }>();
 
@@ -50,6 +52,48 @@ function detectMbSearchEntity(urlStr: string): MbSearchEntity | null {
     // ignore
   }
   return null;
+}
+
+function formatHostPortLabel(urlStr: string): string {
+  try {
+    const parsed = new URL(urlStr);
+    return parsed.host || parsed.hostname || urlStr;
+  } catch {
+    return urlStr;
+  }
+}
+
+function describeQueryEndpoint(urlStr: string, fallbackLabel: string): string {
+  try {
+    const parsed = new URL(urlStr);
+    const lowerPath = parsed.pathname.toLowerCase();
+    const ws2Idx = lowerPath.indexOf('/ws/2/');
+    if (ws2Idx >= 0) {
+      const rel = parsed.pathname.slice(ws2Idx + 6).replace(/^\/+|\/+$/g, '');
+      const segs = rel.split('/').filter(Boolean);
+      const ent = (segs[0] || '').toLowerCase();
+      const hasQuery = parsed.searchParams.has('query');
+      if (hasQuery) {
+        if (ent === 'release') return 'MusicBrainz Album-Suche (Solr)';
+        if (ent === 'recording') return 'MusicBrainz Recording-Suche (Solr)';
+        if (ent === 'release-group') return 'MusicBrainz Release-Group-Suche (Solr)';
+        if (ent === 'artist') return 'MusicBrainz Künstler-Suche (Solr)';
+        return `MusicBrainz Suche (${ent || 'ws/2'})`;
+      }
+      const idVal = segs[1] || '';
+      const shortId = idVal.length > 10 ? `${idVal.slice(0, 8)}…` : idVal;
+      if (ent === 'release') return `MusicBrainz Album-Details${shortId ? ` (MBID ${shortId})` : ''}`;
+      if (ent === 'recording') return `MusicBrainz Track-Details${shortId ? ` (MBID ${shortId})` : ''}`;
+      if (ent === 'release-group') return `MusicBrainz Release-Group${shortId ? ` (${shortId})` : ''}`;
+      if (ent === 'artist') return `MusicBrainz Künstler-Details${shortId ? ` (${shortId})` : ''}`;
+      if (ent === 'discid') return `MusicBrainz DiscID-Abruf${idVal ? ` (${idVal})` : ''}`;
+      if (ent === 'isrc') return `MusicBrainz ISRC-Abruf${idVal ? ` (${idVal})` : ''}`;
+      return `MusicBrainz ${rel || 'ws/2'}`;
+    }
+  } catch {
+    // ignore
+  }
+  return fallbackLabel || 'API';
 }
 
 function isEmptyMbSearchJson(entity: MbSearchEntity, bodyText: string): boolean {
@@ -1091,15 +1135,24 @@ async function fetchWithExponentialBackoff(
     url.startsWith(DEFAULT_MUSICBRAINZ_SERVER_URL) &&
     rewrittenUrl !== url &&
     !isOfficialMusicBrainzUrl(rewrittenUrl);
+  const localSearchIndexEnabled = ctx?.mbLocalSearchIndexEnabled === true;
   const fallbackToOfficial = ctx?.mbFallbackToOfficial !== false;
+  const queryDesc = describeQueryEndpoint(rewrittenUrl, label);
 
   const method = String(options.method || 'GET').toUpperCase();
   const ttlMs = method === 'GET' ? getCacheTtlMsForUrl(rewrittenUrl) : 0;
+
+  const pushMsg = (msg: string) => {
+    const formatted = formatLogLine(msg);
+    logs?.push(formatted);
+    onLogLine?.(formatted);
+  };
 
   if (ttlMs > 0) {
     const cachedBody = readMetadataCache(rewrittenUrl);
     if (cachedBody !== null) {
       if (!(searchEntity && isEmptyMbSearchJson(searchEntity, cachedBody))) {
+        pushMsg(`[CACHE · lokal] ${queryDesc} aus lokalem Cache (0 ms)`);
         return new Response(cachedBody, {
           status: 200,
           headers: { 'content-type': 'application/json; charset=utf-8', 'x-mintrip-cache': 'HIT' },
@@ -1108,15 +1161,16 @@ async function fetchWithExponentialBackoff(
     }
   }
 
-  const pushMsg = (msg: string) => {
-    const formatted = formatLogLine(msg);
-    logs?.push(formatted);
-    onLogLine?.(formatted);
-  };
-
   let effectiveUrl = rewrittenUrl;
-  if (isLocalMirrorRequest && fallbackToOfficial) {
+  let remoteRouteReason = '';
+
+  if (isLocalMirrorRequest && searchEntity && !localSearchIndexEnabled) {
+    // Lokaler Suchindex (Solr) in den Einstellungen deaktiviert -> Freitextsuche direkt an musicbrainz.org senden
+    effectiveUrl = url;
+    remoteRouteReason = 'lokaler Suchindex deaktiviert';
+  } else if (isLocalMirrorRequest && fallbackToOfficial) {
     const configuredBase = ctx?.mbBaseUrl || '';
+    const localHostLabel = formatHostPortLabel(rewrittenUrl);
     const signal = options.signal as AbortSignal | undefined;
     const solrKey = searchEntity ? `${configuredBase}|${searchEntity}` : '';
     const solrCached = solrKey ? mbMirrorSolrStatus.get(solrKey) : undefined;
@@ -1124,10 +1178,13 @@ async function fetchWithExponentialBackoff(
 
     if (mbMirrorUnreachableUrl === configuredBase && nowMs < mbMirrorUnreachableUntil) {
       effectiveUrl = url;
+      remoteRouteReason = 'Fallback: lokaler Mirror im Cooldown';
     } else if (searchEntity && solrCached && nowMs < solrCached.expiresAt && solrCached.empty) {
       // Bekanntermaßen leerer lokaler Solr-Core -> Freitextsuche direkt an musicbrainz.org senden
       effectiveUrl = url;
+      remoteRouteReason = 'Fallback: lokaler Solr-Index leer';
     } else {
+      const localT0 = Date.now();
       try {
         const mirrorTimeout = AbortSignal.timeout(4000);
         const mirrorSignal = signal ? AbortSignal.any([signal, mirrorTimeout]) : mirrorTimeout;
@@ -1135,6 +1192,7 @@ async function fetchWithExponentialBackoff(
           ...options,
           signal: mirrorSignal,
         });
+        const localElapsedMs = Math.max(1, Date.now() - localT0);
         if (![500, 502, 503, 504].includes(mirrorResp.status)) {
           if (mirrorResp.ok) {
             const bodyText = await mirrorResp.text();
@@ -1145,10 +1203,14 @@ async function fetchWithExponentialBackoff(
                 mbMirrorSolrStatus.set(solrKey, { empty: !hasSolrData, expiresAt: Date.now() + 600_000 });
                 if (!hasSolrData) {
                   pushMsg(
-                    `${label}: Lokaler Mirror (${configuredBase}): Solr-Suchindex für „${searchEntity}“ ist leer – weiche für ${searchEntity}-Freitextsuchen automatisch auf musicbrainz.org aus (Direktabrufe per MBID/ISRC/DiscID laufen weiter lokal).`
+                    `[LOKAL · ${localHostLabel}] ${queryDesc}: Solr-Suchindex für „${searchEntity}“ ist leer – weiche automatisch auf [ENTFERNT · musicbrainz.org] aus (Direktabrufe per MBID/ISRC/DiscID laufen weiter lokal).`
                   );
                   effectiveUrl = url;
+                  remoteRouteReason = 'Fallback: lokaler Solr-Index leer';
                 } else {
+                  pushMsg(
+                    `[LOKAL · ${localHostLabel}] ${queryDesc} → HTTP ${mirrorResp.status} (${localElapsedMs} ms, 0 Treffer)`
+                  );
                   return new Response(bodyText, {
                     status: mirrorResp.status,
                     statusText: mirrorResp.statusText,
@@ -1156,6 +1218,9 @@ async function fetchWithExponentialBackoff(
                   });
                 }
               } else {
+                pushMsg(
+                  `[LOKAL · ${localHostLabel}] ${queryDesc} → HTTP ${mirrorResp.status} (${localElapsedMs} ms, 0 Treffer)`
+                );
                 return new Response(bodyText, {
                   status: mirrorResp.status,
                   statusText: mirrorResp.statusText,
@@ -1163,6 +1228,9 @@ async function fetchWithExponentialBackoff(
                 });
               }
             } else {
+              pushMsg(
+                `[LOKAL · ${localHostLabel}] ${queryDesc} → HTTP ${mirrorResp.status} (${localElapsedMs} ms)`
+              );
               if (ttlMs > 0 && (bodyText.trim().startsWith('{') || bodyText.trim().startsWith('['))) {
                 writeMetadataCache(rewrittenUrl, bodyText, ttlMs);
               }
@@ -1173,15 +1241,19 @@ async function fetchWithExponentialBackoff(
               });
             }
           } else {
+            pushMsg(
+              `[LOKAL · ${localHostLabel}] ${queryDesc} → HTTP ${mirrorResp.status} (${localElapsedMs} ms)`
+            );
             return mirrorResp;
           }
         } else {
           mbMirrorUnreachableUrl = configuredBase;
           mbMirrorUnreachableUntil = Date.now() + 30_000;
           pushMsg(
-            `${label}: Lokaler Mirror (${configuredBase}) meldete HTTP ${mirrorResp.status} – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.`
+            `[LOKAL · ${localHostLabel}] ${queryDesc} meldete HTTP ${mirrorResp.status} – weiche 30s auf [ENTFERNT · musicbrainz.org] aus.`
           );
           effectiveUrl = url;
+          remoteRouteReason = `Fallback: lokaler Mirror HTTP ${mirrorResp.status}`;
         }
       } catch (mirrorErr) {
         if (signal?.aborted) {
@@ -1191,12 +1263,20 @@ async function fetchWithExponentialBackoff(
         mbMirrorUnreachableUntil = Date.now() + 30_000;
         const reason = mirrorErr instanceof Error ? mirrorErr.message : String(mirrorErr);
         pushMsg(
-          `${label}: Lokaler Mirror (${configuredBase}) nicht erreichbar (${reason}) – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.`
+          `[LOKAL · ${localHostLabel}] ${queryDesc} nicht erreichbar (${reason}) – weiche 30s auf [ENTFERNT · musicbrainz.org] aus.`
         );
         effectiveUrl = url;
+        remoteRouteReason = 'Fallback: lokaler Mirror nicht erreichbar';
       }
     }
   }
+
+  const isEffectiveLocal = isLocalMirrorRequest && effectiveUrl === rewrittenUrl;
+  const effectiveHostLabel = formatHostPortLabel(effectiveUrl);
+  const originTag = isEffectiveLocal
+    ? `[LOKAL · ${effectiveHostLabel}]`
+    : `[ENTFERNT · ${effectiveHostLabel}]`;
+  const reasonNote = !isEffectiveLocal && remoteRouteReason ? ` (${remoteRouteReason})` : '';
 
   const isOfficialMb = isOfficialMusicBrainzUrl(effectiveUrl);
   const effectiveMaxRetries = isOfficialMb ? Math.min(2, maxRetries) : Math.min(3, maxRetries);
@@ -1213,14 +1293,14 @@ async function fetchWithExponentialBackoff(
       const waitSec = Math.max(1, Math.ceil(remMs / 1000));
       if (waitOnCircuit) {
         pushMsg(
-          `${label}: Rate-Limit-Abkühlpause (${waitSec}s) – warte kurz ab und setze danach fort…`
+          `${originTag} ${queryDesc}: Rate-Limit-Abkühlpause (${waitSec}s) – warte kurz ab und setze danach fort…`
         );
         await sleepMs(remMs + 150, signal);
         mbCircuitOpenUntil = 0;
         mbConsecutive503 = 0;
       } else {
         pushMsg(
-          `${label}: MusicBrainz-Circuit-Breaker aktiv (${waitSec}s Schutzpause nach mehrfachem HTTP 503/429) – überspringe Anfrage.`
+          `${originTag} ${queryDesc}: MusicBrainz-Circuit-Breaker aktiv (${waitSec}s Schutzpause nach mehrfachem HTTP 503/429) – überspringe Anfrage.`
         );
         return new Response(JSON.stringify({ error: 'MusicBrainz Circuit-Breaker aktiv' }), {
           status: 503,
@@ -1235,6 +1315,7 @@ async function fetchWithExponentialBackoff(
       throw new DOMException('Aborted', 'AbortError');
     }
     try {
+      const reqT0 = Date.now();
       const timeoutSignal = AbortSignal.timeout(12000);
       const effectiveSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
       const doFetch = () =>
@@ -1244,13 +1325,14 @@ async function fetchWithExponentialBackoff(
         });
 
       const resp = isOfficialMb ? await runSerializedMbRequest(doFetch, signal) : await doFetch();
+      const elapsedMs = Math.max(1, Date.now() - reqT0);
 
       if ([503, 429, 502, 504].includes(resp.status)) {
         if (isOfficialMb && isMusicBrainzCircuitOpen()) {
           if (waitOnCircuit && attempt < effectiveMaxRetries) {
             const remMs = Math.max(500, mbCircuitOpenUntil - Date.now());
             pushMsg(
-              `${label}: Wiederholtes Rate-Limit (HTTP ${resp.status}) – warte ${Math.ceil(remMs / 1000)}s Abkühlpause und versuche erneut…`
+              `${originTag} ${queryDesc}: Wiederholtes Rate-Limit (HTTP ${resp.status}) – warte ${Math.ceil(remMs / 1000)}s Abkühlpause und versuche erneut…`
             );
             await sleepMs(remMs + 150, signal);
             mbCircuitOpenUntil = 0;
@@ -1258,7 +1340,7 @@ async function fetchWithExponentialBackoff(
             continue;
           }
           pushMsg(
-            `${label}: MusicBrainz-Circuit-Breaker ausgelöst (4× HTTP ${resp.status}) – weiche auf andere Quellen aus.`
+            `${originTag} ${queryDesc}: MusicBrainz-Circuit-Breaker ausgelöst (4× HTTP ${resp.status}) – weiche auf andere Quellen aus.`
           );
           return resp;
         }
@@ -1270,7 +1352,7 @@ async function fetchWithExponentialBackoff(
             mbCooldownUntil = Math.max(mbCooldownUntil, Date.now() + waitMs);
           }
           pushMsg(
-            `${label}: HTTP ${resp.status} (Rate-Limit / Server ausgelastet) – Wiederholungsversuch ${
+            `${originTag} ${queryDesc}: HTTP ${resp.status} (Rate-Limit / Server ausgelastet) – Wiederholungsversuch ${
               attempt + 1
             }/${effectiveMaxRetries} in ${(waitMs / 1000).toFixed(1)}s...`
           );
@@ -1281,9 +1363,14 @@ async function fetchWithExponentialBackoff(
         }
       }
 
+      pushMsg(`${originTag} ${queryDesc}${reasonNote} → HTTP ${resp.status} (${elapsedMs} ms)`);
+
       if (resp.ok && ttlMs > 0) {
         const bodyText = await resp.text();
-        if (bodyText.trim().startsWith('{') || bodyText.trim().startsWith('[')) {
+        if (
+          !(isEffectiveLocal && searchEntity && isEmptyMbSearchJson(searchEntity, bodyText)) &&
+          (bodyText.trim().startsWith('{') || bodyText.trim().startsWith('['))
+        ) {
           writeMetadataCache(effectiveUrl, bodyText, ttlMs);
         }
         return new Response(bodyText, {
@@ -3080,11 +3167,23 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
-  // Per-Request-Kontext für konfigurierbare MusicBrainz-Server-URL, Fallback & Subgenre-Präferenz
+  // Per-Request-Kontext für konfigurierbare MusicBrainz-Server-URL, lokalen Suchindex, Fallback & Subgenre-Präferenz
   app.use('/api', (req, _res, next) => {
     const mbBaseUrl = normalizeMusicBrainzServerUrl(
       req.headers['x-mb-server-url'] || req.query.mbServerUrl
     );
+    const rawLocalSearchIndex = String(
+      req.headers['x-mb-local-search-index'] ?? req.query.mbLocalSearchIndex ?? 'false'
+    )
+      .trim()
+      .toLowerCase();
+    const mbLocalSearchIndexEnabled = rawLocalSearchIndex === 'true' || rawLocalSearchIndex === '1';
+    if (mbLocalSearchIndexEnabled && lastMbLocalSearchIndexEnabled === false) {
+      mbMirrorSolrStatus.clear();
+      mbMirrorUnreachableUntil = 0;
+      mbMirrorUnreachableUrl = '';
+    }
+    lastMbLocalSearchIndexEnabled = mbLocalSearchIndexEnabled;
     const rawFallback = String(req.headers['x-mb-fallback-official'] ?? req.query.mbFallbackOfficial ?? 'true')
       .trim()
       .toLowerCase();
@@ -3093,13 +3192,17 @@ async function startServer() {
       .trim()
       .toLowerCase();
     const preferSubgenres = rawPrefer !== 'false' && rawPrefer !== '0';
-    requestMetaContext.run({ mbBaseUrl, mbFallbackToOfficial, preferSubgenres }, next);
+    requestMetaContext.run(
+      { mbBaseUrl, mbLocalSearchIndexEnabled, mbFallbackToOfficial, preferSubgenres },
+      next
+    );
   });
 
   // Verbindungstest für lokalen MusicBrainz-Docker-Container oder offizielle Server
   app.post('/api/musicbrainz/test-connection', async (req, res) => {
     const body = (req.body || {}) as Record<string, unknown>;
     const useLocalMirror = Boolean(body.useLocalMirror);
+    const localSearchIndexEnabled = Boolean(body.localSearchIndexEnabled);
     let targetBase = DEFAULT_MUSICBRAINZ_SERVER_URL;
     if (useLocalMirror) {
       const host = normalizeMbHostInput(body.host);
@@ -3147,7 +3250,9 @@ async function startServer() {
               status: resp.status,
               solrReleaseOk: true,
               solrRecordingOk: true,
-              message: `Datenbank OK (${elapsedMs} ms) · Solr-Suchindex (Release & Recording) aktiv – kein Rate-Limit`,
+              message: localSearchIndexEnabled
+                ? `Datenbank OK (${elapsedMs} ms) · Solr-Suchindex (Release & Recording) aktiv – alle Suchen laufen lokal ohne Rate-Limit`
+                : `Datenbank OK (${elapsedMs} ms) · Solr-Suchindex (Release & Recording) gefunden – Checkbox „Lokalen Suchindex (Solr) aktivieren“ einschalten, um ihn zu nutzen`,
             });
           }
           const emptyParts: string[] = [];
@@ -3160,7 +3265,7 @@ async function startServer() {
             status: resp.status,
             solrReleaseOk: relOk,
             solrRecordingOk: recOk,
-            message: `Datenbank OK (${elapsedMs} ms) · ⚠ Solr-Suchindex (${emptyParts.join(' & ')}) leer – Freitextsuchen weichen automatisch auf musicbrainz.org aus, Detail-/ISRC-/MBID-Abrufe laufen lokal`,
+            message: `Datenbank OK (${elapsedMs} ms) · ⚠ Solr-Suchindex (${emptyParts.join(' & ')}) leer – Freitextsuchen laufen über musicbrainz.org, Detail-/ISRC-/MBID-Abrufe laufen lokal`,
           });
         }
         return res.json({

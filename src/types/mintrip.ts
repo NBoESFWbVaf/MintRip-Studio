@@ -530,6 +530,7 @@ export interface ExportSettings {
   mbUseLocalMirror?: boolean;
   mbLocalHost?: string;
   mbLocalPort?: number;
+  mbLocalSearchIndexEnabled?: boolean;
   mbFallbackToOfficial?: boolean;
   mbLoadDeepRelations?: boolean;
   preferSubgenres?: boolean;

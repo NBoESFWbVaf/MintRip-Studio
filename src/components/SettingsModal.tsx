@@ -153,6 +153,7 @@ function SettingsNotebookContent({
       : legacyMbParsed.useLocalMirror;
   const mbLocalHost = settings.mbLocalHost ?? legacyMbParsed.host ?? DEFAULT_MB_LOCAL_HOST;
   const mbLocalPort = settings.mbLocalPort ?? legacyMbParsed.port ?? DEFAULT_MB_LOCAL_PORT;
+  const mbLocalSearchIndexEnabled = Boolean(settings.mbLocalSearchIndexEnabled);
   const mbFallbackToOfficial = settings.mbFallbackToOfficial !== false;
   const effectiveMbServerUrl = buildMusicBrainzServerUrl(mbUseLocalMirror, mbLocalHost, mbLocalPort);
 
@@ -160,6 +161,7 @@ function SettingsNotebookContent({
     useLocalMirror?: boolean;
     host?: string;
     port?: number;
+    localSearchIndexEnabled?: boolean;
     fallbackToOfficial?: boolean;
   }) => {
     setMbConnStatus(null);
@@ -177,6 +179,10 @@ function SettingsNotebookContent({
         patch.port !== undefined
           ? patch.port
           : s.mbLocalPort ?? fallbackParsed.port ?? DEFAULT_MB_LOCAL_PORT;
+      const nextLocalSearchIndex =
+        patch.localSearchIndexEnabled !== undefined
+          ? patch.localSearchIndexEnabled
+          : Boolean(s.mbLocalSearchIndexEnabled);
       const nextFallback =
         patch.fallbackToOfficial !== undefined
           ? patch.fallbackToOfficial
@@ -186,6 +192,7 @@ function SettingsNotebookContent({
         mbUseLocalMirror: nextUseLocal,
         mbLocalHost: nextHost,
         mbLocalPort: nextPort,
+        mbLocalSearchIndexEnabled: nextLocalSearchIndex,
         mbFallbackToOfficial: nextFallback,
         musicbrainzServerUrl: buildMusicBrainzServerUrl(nextUseLocal, nextHost, nextPort),
       };
@@ -203,6 +210,7 @@ function SettingsNotebookContent({
           useLocalMirror: mbUseLocalMirror,
           host: normalizeMbLocalHost(mbLocalHost),
           port: normalizeMbLocalPort(mbLocalPort),
+          localSearchIndexEnabled: mbLocalSearchIndexEnabled,
         }),
       });
       const data = await resp.json().catch(() => ({}));
@@ -1463,6 +1471,24 @@ function SettingsNotebookContent({
                     <input
                       type="checkbox"
                       disabled={!mbUseLocalMirror}
+                      checked={mbLocalSearchIndexEnabled}
+                      onChange={(e) =>
+                        updateMbMirrorSettings({ localSearchIndexEnabled: e.target.checked })
+                      }
+                      className="accent-[#5BA632] mt-0.5"
+                    />
+                    <span className="text-[11px] text-[#57606A] dark:text-[#8B949E]">
+                      <span className="font-medium text-[#1F2328] dark:text-[#EAEEF2]">
+                        Lokalen MusicBrainz-Suchindex (Solr) für Freitextsuchen aktivieren
+                      </span>{' '}
+                      (Alben-, Titel- &amp; Künstler-Suchen laufen lokal ohne Rate-Limit; deaktiviert = Freitextsuchen direkt über <span className="font-mono">musicbrainz.org</span>, MBID-/ISRC-/DiscID-Abrufe bleiben lokal).
+                    </span>
+                  </label>
+
+                  <label className={`pl-6 flex items-start gap-2.5 ${mbUseLocalMirror ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}>
+                    <input
+                      type="checkbox"
+                      disabled={!mbUseLocalMirror}
                       checked={mbFallbackToOfficial}
                       onChange={(e) =>
                         updateMbMirrorSettings({ fallbackToOfficial: e.target.checked })
@@ -1496,9 +1522,11 @@ function SettingsNotebookContent({
                       <span className="text-[#57606A] dark:text-[#8B949E]">
                         Aktiver Endpunkt: <span className="font-mono">{effectiveMbServerUrl}</span>
                         {mbUseLocalMirror
-                          ? mbFallbackToOfficial
-                            ? ' · automatischer Fallback auf musicbrainz.org aktiv'
-                            : ' · Fallback deaktiviert'
+                          ? `${mbLocalSearchIndexEnabled ? ' · lokaler Suchindex (Solr) aktiv' : ' · lokaler Suchindex deaktiviert (Freitextsuchen über musicbrainz.org)'}${
+                              mbFallbackToOfficial
+                                ? ' · automatischer Fallback auf musicbrainz.org aktiv'
+                                : ' · Fallback deaktiviert'
+                            }`
                           : ' (offizielle MusicBrainz-Server)'}
                       </span>
                     )}

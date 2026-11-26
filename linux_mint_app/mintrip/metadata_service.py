@@ -91,6 +91,13 @@ def _get_configured_mb_base_url(explicit_url: str = "") -> str:
     return DEFAULT_MUSICBRAINZ_SERVER_URL
 
 
+def _is_mb_local_search_index_enabled() -> bool:
+    cfg = _read_settings_json_dict()
+    if "mb_local_search_index_enabled" in cfg:
+        return bool(cfg["mb_local_search_index_enabled"])
+    return False
+
+
 def _is_mb_fallback_to_official_enabled() -> bool:
     cfg = _read_settings_json_dict()
     if "mb_fallback_to_official" in cfg:
@@ -972,6 +979,7 @@ def _urlopen_with_backoff(
     label: str = "API",
     cancel_event: Optional[threading.Event] = None,
     wait_on_circuit: bool = False,
+    log_origin: bool = True,
 ) -> bytes:
     """Führt einen HTTP-Request mit Startzeit-Token-Bucket (1.18s), Circuit-Breaker, Retry-After & Backoff aus."""
     global _LAST_MB_STARTED_TS, _MB_COOLDOWN_UNTIL, _MB_MIN_INTERVAL_SEC, _MB_CONSECUTIVE_503, _MB_CIRCUIT_OPEN_UNTIL
@@ -1026,11 +1034,18 @@ def _urlopen_with_backoff(
                     _LAST_MB_STARTED_TS = time.monotonic()
 
                 try:
+                    t_req = time.monotonic()
                     with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        status_code = getattr(resp, "status", 200)
                         body = resp.read()
+                    elapsed_ms = max(1, int(round((time.monotonic() - t_req) * 1000)))
                     with _MB_RATE_LOCK:
                         _MB_CONSECUTIVE_503 = 0
                         _MB_MIN_INTERVAL_SEC = max(1.18, _MB_MIN_INTERVAL_SEC - 0.10)
+                    if log_origin and on_log is not None:
+                        host_lbl = _format_host_port_label(req.full_url)
+                        q_desc = _describe_query_endpoint(req.full_url, label)
+                        _log_step(f"[ENTFERNT · {host_lbl}] {q_desc} → HTTP {status_code} ({elapsed_ms} ms)", on_log)
                     return body
                 except urllib.error.HTTPError as http_exc:
                     if http_exc.code in (503, 429):
@@ -1046,8 +1061,20 @@ def _urlopen_with_backoff(
                                 _MB_CIRCUIT_OPEN_UNTIL = time.monotonic() + 10.0
                     raise
             else:
+                t_req = time.monotonic()
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.read()
+                    status_code = getattr(resp, "status", 200)
+                    body = resp.read()
+                elapsed_ms = max(1, int(round((time.monotonic() - t_req) * 1000)))
+                if log_origin and on_log is not None:
+                    host_lbl = _format_host_port_label(req.full_url)
+                    q_desc = _describe_query_endpoint(req.full_url, label)
+                    origin_prefix = "[LOKAL" if _is_local_or_private_url(req.full_url) else "[ENTFERNT"
+                    _log_step(
+                        f"{origin_prefix} · {host_lbl}] {q_desc} → HTTP {status_code} ({elapsed_ms} ms)",
+                        on_log,
+                    )
+                return body
         except InterruptedError:
             raise
         except urllib.error.HTTPError as http_exc:
@@ -1165,9 +1192,80 @@ def _probe_local_mirror_solr_entity(base_url: str, entity: str, timeout: float =
         return False
 
 
-def test_musicbrainz_connection(server_url: str, timeout: float = 4.0) -> tuple[bool, int, str]:
+def _format_host_port_label(url_str: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        return parsed.netloc or parsed.hostname or url_str
+    except Exception:
+        return url_str
+
+
+def _is_local_or_private_url(url_str: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(url_str).hostname or "").strip().lower()
+        if not host:
+            return False
+        if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local") or host.endswith(".lan"):
+            return True
+        if host.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _describe_query_endpoint(url_str: str, fallback_label: str = "API") -> str:
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        lower_path = parsed.path.lower()
+        ws2_idx = lower_path.find("/ws/2/")
+        if ws2_idx >= 0:
+            rel = parsed.path[ws2_idx + 6 :].strip("/")
+            segs = [s for s in rel.split("/") if s]
+            ent = (segs[0] if segs else "").lower()
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "query" in qs:
+                if ent == "release":
+                    return "MusicBrainz Album-Suche (Solr)"
+                if ent == "recording":
+                    return "MusicBrainz Recording-Suche (Solr)"
+                if ent == "release-group":
+                    return "MusicBrainz Release-Group-Suche (Solr)"
+                if ent == "artist":
+                    return "MusicBrainz Künstler-Suche (Solr)"
+                return f"MusicBrainz Suche ({ent or 'ws/2'})"
+            id_val = segs[1] if len(segs) > 1 else ""
+            short_id = f"{id_val[:8]}…" if len(id_val) > 10 else id_val
+            if ent == "release":
+                return f"MusicBrainz Album-Details{f' (MBID {short_id})' if short_id else ''}"
+            if ent == "recording":
+                return f"MusicBrainz Track-Details{f' (MBID {short_id})' if short_id else ''}"
+            if ent == "release-group":
+                return f"MusicBrainz Release-Group{f' ({short_id})' if short_id else ''}"
+            if ent == "artist":
+                return f"MusicBrainz Künstler-Details{f' ({short_id})' if short_id else ''}"
+            if ent == "discid":
+                return f"MusicBrainz DiscID-Abruf{f' ({id_val})' if id_val else ''}"
+            if ent == "isrc":
+                return f"MusicBrainz ISRC-Abruf{f' ({id_val})' if id_val else ''}"
+            return f"MusicBrainz {rel or 'ws/2'}"
+    except Exception:
+        pass
+    return fallback_label or "API"
+
+
+def test_musicbrainz_connection(
+    server_url: str,
+    timeout: float = 4.0,
+    local_search_index_enabled: Optional[bool] = None,
+) -> tuple[bool, int, str]:
     """Prüft Datenbank (PostgreSQL) und bei lokalem Mirror zusätzlich die Solr-Suchindizes (Release & Recording)."""
     base_url = normalize_musicbrainz_server_url(server_url)
+    search_idx_on = (
+        _is_mb_local_search_index_enabled()
+        if local_search_index_enabled is None
+        else bool(local_search_index_enabled)
+    )
     probe_url = f"{base_url}/artist/5b11f4ce-a62d-471e-81fc-a69a8278c7da?fmt=json"
     req = urllib.request.Request(
         probe_url,
@@ -1193,10 +1291,16 @@ def test_musicbrainz_connection(server_url: str, timeout: float = 4.0) -> tuple[
                         _MB_MIRROR_SOLR_STATUS[(base_url, "release")] = (not rel_ok, now_mono + 600.0)
                         _MB_MIRROR_SOLR_STATUS[(base_url, "recording")] = (not rec_ok, now_mono + 600.0)
                     if rel_ok and rec_ok:
+                        if search_idx_on:
+                            return (
+                                True,
+                                elapsed_ms,
+                                f"Datenbank OK ({elapsed_ms} ms) · Solr-Suchindex (Release & Recording) aktiv – alle Suchen laufen lokal ohne Rate-Limit",
+                            )
                         return (
                             True,
                             elapsed_ms,
-                            f"Datenbank OK ({elapsed_ms} ms) · Solr-Suchindex (Release & Recording) aktiv – kein Rate-Limit",
+                            f"Datenbank OK ({elapsed_ms} ms) · Solr-Suchindex (Release & Recording) gefunden – Checkbox „Lokalen Suchindex (Solr) aktivieren“ einschalten, um ihn zu nutzen",
                         )
                     empty_parts = []
                     if not rel_ok:
@@ -1207,7 +1311,7 @@ def test_musicbrainz_connection(server_url: str, timeout: float = 4.0) -> tuple[
                     return (
                         True,
                         elapsed_ms,
-                        f"Datenbank OK ({elapsed_ms} ms) · ⚠ Solr-Suchindex ({empty_label}) leer – Freitextsuchen weichen automatisch auf musicbrainz.org aus, Detail-/ISRC-/MBID-Abrufe laufen lokal",
+                        f"Datenbank OK ({elapsed_ms} ms) · ⚠ Solr-Suchindex ({empty_label}) leer – Freitextsuchen laufen über musicbrainz.org, Detail-/ISRC-/MBID-Abrufe laufen lokal",
                     )
                 return True, elapsed_ms, f"Verbunden mit musicbrainz.org ({elapsed_ms} ms)"
             return False, elapsed_ms, f"Unerwartete Antwort (HTTP {status}) von {base_url}"
@@ -1235,6 +1339,7 @@ def _mb_ws2_get_json(
     configured_base = _get_configured_mb_base_url(mb_server_url)
     clean_path = path.lstrip("/")
     search_entity = _detect_mb_search_entity(clean_path)
+    query_desc = _describe_query_endpoint(f"{configured_base}/{clean_path}", "MusicBrainz")
     # Kanonischer Cache-Key, damit Cache-Treffer nahtlos zwischen lokalem Mirror und musicbrainz.org geteilt werden
     cache_key = f"mb:{clean_path}"
 
@@ -1243,6 +1348,7 @@ def _mb_ws2_get_json(
         if isinstance(cached, dict):
             # Keine veralteten leeren Suchantworten aus dem Cache erzwingen, falls lokal gesucht wird
             if not (search_entity and _is_empty_mb_search_payload(search_entity, cached)):
+                _log_step(f"[CACHE · lokal] {query_desc} aus lokalem Cache (0 ms)", on_log)
                 return cached
 
     if ttl_sec is None:
@@ -1254,10 +1360,21 @@ def _mb_ws2_get_json(
             ttl_sec = 86400 * 30
 
     is_local_mirror = not _is_official_musicbrainz_host(configured_base)
+    local_search_index_enabled = _is_mb_local_search_index_enabled()
     fallback_enabled = _is_mb_fallback_to_official_enabled()
 
-    def _do_request(target_base: str, req_timeout: int, req_retries: int, allow_cache_empty: bool = True) -> dict:
+    def _do_request(
+        target_base: str,
+        req_timeout: int,
+        req_retries: int,
+        allow_cache_empty: bool = True,
+        route_reason: str = "",
+    ) -> dict:
         url = f"{target_base}/{clean_path}"
+        is_target_local = not _is_official_musicbrainz_host(target_base)
+        host_lbl = _format_host_port_label(target_base)
+        origin_tag = f"[LOKAL · {host_lbl}]" if is_target_local else f"[ENTFERNT · {host_lbl}]"
+        reason_note = f" ({route_reason})" if (not is_target_local and route_reason) else ""
         req = urllib.request.Request(
             url,
             headers={
@@ -1266,22 +1383,41 @@ def _mb_ws2_get_json(
                 "Connection": "keep-alive",
             },
         )
+        t_req = time.monotonic()
         raw = _urlopen_with_backoff(
             req,
             timeout=req_timeout,
             max_retries=req_retries,
             on_log=on_log,
-            label="MusicBrainz",
+            label=f"{origin_tag} {query_desc}",
             cancel_event=cancel_event,
             wait_on_circuit=wait_on_circuit,
+            log_origin=False,
         )
+        elapsed_ms = max(1, int(round((time.monotonic() - t_req) * 1000)))
         parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        zero_note = (
+            ", 0 Treffer"
+            if (is_target_local and search_entity and _is_empty_mb_search_payload(search_entity, parsed))
+            else ""
+        )
+        _log_step(f"{origin_tag} {query_desc}{reason_note} → HTTP 200 ({elapsed_ms} ms{zero_note})", on_log)
         if use_cache and isinstance(parsed, dict):
             if allow_cache_empty or not (search_entity and _is_empty_mb_search_payload(search_entity, parsed)):
                 _cache_set_json(cache_key, parsed, ttl_sec=ttl_sec)
         return parsed
 
+    if is_local_mirror and search_entity and not local_search_index_enabled:
+        # Lokaler Suchindex (Solr) deaktiviert -> Freitextsuche direkt an musicbrainz.org senden
+        return _do_request(
+            DEFAULT_MUSICBRAINZ_SERVER_URL,
+            timeout,
+            max_retries,
+            route_reason="lokaler Suchindex deaktiviert",
+        )
+
     if is_local_mirror and fallback_enabled:
+        local_host_lbl = _format_host_port_label(configured_base)
         now_mono = time.monotonic()
         with _MB_RATE_LOCK:
             mirror_in_cooldown = (
@@ -1289,10 +1425,20 @@ def _mb_ws2_get_json(
             )
             solr_cached = _MB_MIRROR_SOLR_STATUS.get((configured_base, search_entity)) if search_entity else None
         if mirror_in_cooldown:
-            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+            return _do_request(
+                DEFAULT_MUSICBRAINZ_SERVER_URL,
+                timeout,
+                max_retries,
+                route_reason="Fallback: lokaler Mirror im Cooldown",
+            )
         if search_entity and solr_cached is not None and now_mono < solr_cached[1] and solr_cached[0]:
             # Bekanntermaßen leerer lokaler Solr-Core -> Freitextsuche direkt an musicbrainz.org senden
-            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+            return _do_request(
+                DEFAULT_MUSICBRAINZ_SERVER_URL,
+                timeout,
+                max_retries,
+                route_reason="Fallback: lokaler Solr-Index leer",
+            )
         try:
             # Schneller Timeout & kein Retry auf lokalem Mirror, damit bei gestopptem Docker-Container sofort ausgewichen wird
             local_res = _do_request(
@@ -1312,11 +1458,16 @@ def _mb_ws2_get_json(
                         )
                     if not has_solr_data:
                         _log_step(
-                            f"[MusicBrainz] Lokaler Mirror ({configured_base}): Solr-Suchindex für „{search_entity}“ ist leer – "
-                            f"weiche für {search_entity}-Freitextsuchen automatisch auf musicbrainz.org aus (Direktabrufe per MBID/ISRC/DiscID laufen weiter lokal).",
+                            f"[LOKAL · {local_host_lbl}] {query_desc}: Solr-Suchindex für „{search_entity}“ ist leer – "
+                            f"weiche automatisch auf [ENTFERNT · musicbrainz.org] aus (Direktabrufe per MBID/ISRC/DiscID laufen weiter lokal).",
                             on_log,
                         )
-                        return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+                        return _do_request(
+                            DEFAULT_MUSICBRAINZ_SERVER_URL,
+                            timeout,
+                            max_retries,
+                            route_reason="Fallback: lokaler Solr-Index leer",
+                        )
             return local_res
         except InterruptedError:
             raise
@@ -1327,10 +1478,15 @@ def _mb_ws2_get_json(
                 _MB_MIRROR_UNREACHABLE_URL = configured_base
                 _MB_MIRROR_UNREACHABLE_UNTIL = time.monotonic() + 30.0
             _log_step(
-                f"[MusicBrainz] Lokaler Mirror ({configured_base}) meldete HTTP {http_exc.code} – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.",
+                f"[LOKAL · {local_host_lbl}] {query_desc} meldete HTTP {http_exc.code} – weiche 30s auf [ENTFERNT · musicbrainz.org] aus.",
                 on_log,
             )
-            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+            return _do_request(
+                DEFAULT_MUSICBRAINZ_SERVER_URL,
+                timeout,
+                max_retries,
+                route_reason=f"Fallback: lokaler Mirror HTTP {http_exc.code}",
+            )
         except (
             urllib.error.URLError,
             TimeoutError,
@@ -1345,10 +1501,15 @@ def _mb_ws2_get_json(
                 _MB_MIRROR_UNREACHABLE_UNTIL = time.monotonic() + 30.0
             reason = getattr(mirror_exc, "reason", None) or str(mirror_exc)
             _log_step(
-                f"[MusicBrainz] Lokaler Mirror ({configured_base}) nicht erreichbar ({reason}) – weiche 30s auf offizielle MusicBrainz-Server (musicbrainz.org) aus.",
+                f"[LOKAL · {local_host_lbl}] {query_desc} nicht erreichbar ({reason}) – weiche 30s auf [ENTFERNT · musicbrainz.org] aus.",
                 on_log,
             )
-            return _do_request(DEFAULT_MUSICBRAINZ_SERVER_URL, timeout, max_retries)
+            return _do_request(
+                DEFAULT_MUSICBRAINZ_SERVER_URL,
+                timeout,
+                max_retries,
+                route_reason="Fallback: lokaler Mirror nicht erreichbar",
+            )
 
     return _do_request(configured_base, timeout, max_retries, allow_cache_empty=not is_local_mirror)
 

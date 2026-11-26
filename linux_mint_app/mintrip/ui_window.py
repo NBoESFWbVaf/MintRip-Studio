@@ -3065,6 +3065,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self.query_log_view.set_cursor_visible(False)
         self.query_log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.query_log_view.set_monospace(True)
+        self._init_query_log_tags()
         log_scroll.add(self.query_log_view)
         self.query_log_panel.pack_start(log_scroll, True, True, 0)
 
@@ -3962,6 +3963,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
         was_roman = bool(getattr(self.settings, "convert_roman_numerals", True))
         self.settings = new_settings
         self.theme_watcher.set_mode(new_theme_mode)
+        self._update_query_log_tag_colors()
         self._apply_left_tag_field_visibility()
         self._update_query_log_visibility()
         cov_max_dim = normalize_cover_max_dimension(
@@ -4004,8 +4006,17 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 getattr(self.settings, "cover_providers", DEFAULT_COVER_PROVIDERS)
             )
         )
+        if getattr(self.settings, "mb_use_local_mirror", False):
+            mb_mode_txt = (
+                f"Lokal ({self.settings.mb_local_host}:{self.settings.mb_local_port}, "
+                f"Suchindex={'Ein' if getattr(self.settings, 'mb_local_search_index_enabled', False) else 'Aus'}, "
+                f"Fallback={'Ein' if getattr(self.settings, 'mb_fallback_to_official', True) else 'Aus'})"
+            )
+        else:
+            mb_mode_txt = "Entfernt (musicbrainz.org)"
         self._append_query_log_ui(
             f"[Einstellungen] Gespeichert: Format={self.settings.export_format.value.upper()}, "
+            f"MusicBrainz={mb_mode_txt}, "
             f"Zielordner={self.settings.output_dir}, Import-Ordner={self.settings.last_import_dir}, "
             f"Cover-Max={cov_max_dim} px, Cover-Quellen={cov_prov_cnt}/{len(COVER_PROVIDER_OPTIONS)}, "
             f"Threads={eff_threads}, Normalisierung={norm_state}, "
@@ -6952,6 +6963,74 @@ class MintRipWindow(Gtk.ApplicationWindow):
         self._append_query_log_batch_ui([line])
         return False
 
+    def _init_query_log_tags(self) -> None:
+        if not hasattr(self, "query_log_view"):
+            return
+        buf = self.query_log_view.get_buffer()
+        tag_table = buf.get_tag_table()
+        for name, weight in (
+            ("log_local", Pango.Weight.SEMIBOLD),
+            ("log_remote", Pango.Weight.SEMIBOLD),
+            ("log_cache", Pango.Weight.NORMAL),
+            ("log_error", Pango.Weight.SEMIBOLD),
+            ("log_shazam", Pango.Weight.SEMIBOLD),
+            ("log_discogs", Pango.Weight.SEMIBOLD),
+            ("log_settings", Pango.Weight.NORMAL),
+        ):
+            if tag_table.lookup(name) is None:
+                buf.create_tag(name, weight=weight)
+        self._update_query_log_tag_colors()
+
+    def _update_query_log_tag_colors(self) -> None:
+        if not hasattr(self, "query_log_view"):
+            return
+        dark = bool(hasattr(self, "theme_watcher") and self.theme_watcher.is_dark_active())
+        palette = (
+            {
+                "log_local": "#4ADE80",
+                "log_remote": "#60A5FA",
+                "log_cache": "#2DD4BF",
+                "log_error": "#F87171",
+                "log_shazam": "#7DD3FC",
+                "log_discogs": "#FCD34D",
+                "log_settings": "#58A6FF",
+            }
+            if dark
+            else {
+                "log_local": "#047857",
+                "log_remote": "#1D4ED8",
+                "log_cache": "#0F766E",
+                "log_error": "#C62828",
+                "log_shazam": "#0369A1",
+                "log_discogs": "#B45309",
+                "log_settings": "#0969DA",
+            }
+        )
+        tag_table = self.query_log_view.get_buffer().get_tag_table()
+        for name, color in palette.items():
+            tag = tag_table.lookup(name)
+            if tag is not None:
+                tag.set_property("foreground", color)
+
+    @staticmethod
+    def _classify_query_log_tag(line: str) -> Optional[str]:
+        low = line.lower()
+        if any(tok in low for tok in ("fehler", "nicht erreichbar", "kein cover", "abgebrochen")):
+            return "log_error"
+        if "[LOKAL" in line:
+            return "log_local"
+        if "[ENTFERNT" in line:
+            return "log_remote"
+        if "[CACHE" in line:
+            return "log_cache"
+        if "shazam" in low:
+            return "log_shazam"
+        if "discogs" in low:
+            return "log_discogs"
+        if "[einstellungen]" in low or "[profil]" in low or "[ansicht]" in low:
+            return "log_settings"
+        return None
+
     def _append_query_log_batch_ui(self, lines: list[str]) -> bool:
         if not lines or not hasattr(self, "query_log_view"):
             return False
@@ -6961,9 +7040,19 @@ class MintRipWindow(Gtk.ApplicationWindow):
             for line in lines
         ]
         buf = self.query_log_view.get_buffer()
-        end_iter = buf.get_end_iter()
-        prefix = "\n" if buf.get_char_count() > 0 else ""
-        buf.insert(end_iter, f"{prefix}" + "\n".join(formatted_lines))
+        tag_table = buf.get_tag_table()
+        for fmt_line in formatted_lines:
+            end_iter = buf.get_end_iter()
+            prefix = "\n" if buf.get_char_count() > 0 else ""
+            tag_name = self._classify_query_log_tag(fmt_line)
+            tag = tag_table.lookup(tag_name) if tag_name else None
+            if tag is not None:
+                if prefix:
+                    buf.insert(end_iter, prefix)
+                    end_iter = buf.get_end_iter()
+                buf.insert_with_tags(end_iter, fmt_line, tag)
+            else:
+                buf.insert(end_iter, f"{prefix}{fmt_line}")
         line_cnt = buf.get_line_count()
         if line_cnt > 2200:
             trim_iter = buf.get_iter_at_line(line_cnt - 1600)

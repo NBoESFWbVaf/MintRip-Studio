@@ -1412,6 +1412,7 @@ class ExportSettings:
     mb_use_local_mirror: bool = False
     mb_local_host: str = DEFAULT_MB_LOCAL_HOST
     mb_local_port: int = DEFAULT_MB_LOCAL_PORT
+    mb_local_search_index_enabled: bool = False
     mb_fallback_to_official: bool = True
     mb_load_deep_relations: bool = False
     prefer_subgenres: bool = True

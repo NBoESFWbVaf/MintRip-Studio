@@ -153,6 +153,8 @@ def load_saved_settings() -> ExportSettings:
             settings.musicbrainz_server_url = build_musicbrainz_server_url(
                 parsed_local, parsed_host, parsed_port
             )
+        if "mb_local_search_index_enabled" in data:
+            settings.mb_local_search_index_enabled = bool(data["mb_local_search_index_enabled"])
         if "mb_fallback_to_official" in data:
             settings.mb_fallback_to_official = bool(data["mb_fallback_to_official"])
         if "mb_load_deep_relations" in data:
@@ -242,6 +244,7 @@ def save_settings(settings: ExportSettings, theme_mode: str | None = None) -> No
         "mb_use_local_mirror": bool(getattr(settings, "mb_use_local_mirror", False)),
         "mb_local_host": normalize_mb_local_host(getattr(settings, "mb_local_host", DEFAULT_MB_LOCAL_HOST)),
         "mb_local_port": normalize_mb_local_port(getattr(settings, "mb_local_port", DEFAULT_MB_LOCAL_PORT)),
+        "mb_local_search_index_enabled": bool(getattr(settings, "mb_local_search_index_enabled", False)),
         "mb_fallback_to_official": bool(getattr(settings, "mb_fallback_to_official", True)),
         "musicbrainz_server_url": build_musicbrainz_server_url(
             bool(getattr(settings, "mb_use_local_mirror", False)),
@@ -1008,6 +1011,20 @@ class SettingsPanel(Gtk.Box):
         self.mb_local_row.pack_start(self.btn_test_mb_connection, False, False, 0)
         tab4.pack_start(self.mb_local_row, False, False, 0)
 
+        self.check_mb_local_search_index = Gtk.CheckButton(
+            label="Lokalen MusicBrainz-Suchindex (Solr) für Freitextsuchen aktivieren"
+        )
+        self.check_mb_local_search_index.set_margin_start(22)
+        self.check_mb_local_search_index.set_active(
+            bool(getattr(self.settings, "mb_local_search_index_enabled", False))
+        )
+        self.check_mb_local_search_index.set_tooltip_text(
+            "Aktiviert = Freitextsuchen (Alben, Titel, Interpreten) laufen direkt über den lokalen Solr-Suchindex ohne Rate-Limit. "
+            "Deaktiviert = Freitextsuchen gehen direkt an musicbrainz.org, während Direktabrufe (MBID/ISRC/DiscID) lokal bleiben."
+        )
+        self.check_mb_local_search_index.connect("toggled", self._on_mb_mirror_settings_changed)
+        tab4.pack_start(self.check_mb_local_search_index, False, False, 0)
+
         self.check_mb_fallback_official = Gtk.CheckButton(
             label="Bei Nichterreichbarkeit automatisch auf offizielle MusicBrainz-Server (musicbrainz.org) ausweichen"
         )
@@ -1422,6 +1439,10 @@ class SettingsPanel(Gtk.Box):
             self.spin_mb_local_port.set_value(
                 normalize_mb_local_port(getattr(settings, "mb_local_port", DEFAULT_MB_LOCAL_PORT))
             )
+        if hasattr(self, "check_mb_local_search_index"):
+            self.check_mb_local_search_index.set_active(
+                bool(getattr(settings, "mb_local_search_index_enabled", False))
+            )
         if hasattr(self, "check_mb_fallback_official"):
             self.check_mb_fallback_official.set_active(
                 bool(getattr(settings, "mb_fallback_to_official", True))
@@ -1562,6 +1583,8 @@ class SettingsPanel(Gtk.Box):
             self.entry_mb_local_host.set_sensitive(use_local)
         if hasattr(self, "spin_mb_local_port"):
             self.spin_mb_local_port.set_sensitive(use_local)
+        if hasattr(self, "check_mb_local_search_index"):
+            self.check_mb_local_search_index.set_sensitive(use_local)
         if hasattr(self, "check_mb_fallback_official"):
             self.check_mb_fallback_official.set_sensitive(use_local)
         if hasattr(self, "mb_server_status_label"):
@@ -1570,13 +1593,19 @@ class SettingsPanel(Gtk.Box):
             else:
                 eff_url = self._get_effective_mb_url_from_widgets()
                 if use_local:
+                    solr_txt = (
+                        " · lokaler Suchindex (Solr) aktiv"
+                        if hasattr(self, "check_mb_local_search_index")
+                        and self.check_mb_local_search_index.get_active()
+                        else " · lokaler Suchindex deaktiviert (Freitextsuchen über musicbrainz.org)"
+                    )
                     fb_txt = (
                         " · automatischer Fallback auf musicbrainz.org aktiv"
                         if self.check_mb_fallback_official.get_active()
                         else " · Fallback deaktiviert"
                     )
                     self.mb_server_status_label.set_markup(
-                        f"Aktiver Endpunkt: <tt>{GLib.markup_escape_text(eff_url)}</tt>{GLib.markup_escape_text(fb_txt)}"
+                        f"Aktiver Endpunkt: <tt>{GLib.markup_escape_text(eff_url)}</tt>{GLib.markup_escape_text(solr_txt)}{GLib.markup_escape_text(fb_txt)}"
                     )
                 else:
                     self.mb_server_status_label.set_markup(
@@ -1588,15 +1617,22 @@ class SettingsPanel(Gtk.Box):
 
     def _on_test_mb_connection_clicked(self, _btn: Gtk.Button) -> None:
         target_url = self._get_effective_mb_url_from_widgets()
+        use_local = self.check_mb_use_local_mirror.get_active()
+        search_idx_active = bool(
+            hasattr(self, "check_mb_local_search_index") and self.check_mb_local_search_index.get_active()
+        )
+        fb_active = self.check_mb_fallback_official.get_active()
         self.btn_test_mb_connection.set_sensitive(False)
         self._update_mb_mirror_ui_state(
             f"Prüfe Verbindung zu <tt>{GLib.markup_escape_text(target_url)}</tt>…"
         )
 
         def _worker() -> None:
-            ok, _ms, msg = test_musicbrainz_connection(target_url, timeout=4.0)
-            use_local = self.check_mb_use_local_mirror.get_active()
-            fb_active = self.check_mb_fallback_official.get_active()
+            ok, _ms, msg = test_musicbrainz_connection(
+                target_url,
+                timeout=4.0,
+                local_search_index_enabled=search_idx_active,
+            )
             if ok:
                 markup = f"<span foreground='#2e7d32'><b>✓ {GLib.markup_escape_text(msg)}</b></span> (<tt>{GLib.markup_escape_text(target_url)}</tt>)"
             else:
@@ -1844,6 +1880,8 @@ class SettingsPanel(Gtk.Box):
             self.settings.mb_local_host = normalize_mb_local_host(self.entry_mb_local_host.get_text())
         if hasattr(self, "spin_mb_local_port"):
             self.settings.mb_local_port = normalize_mb_local_port(self.spin_mb_local_port.get_value_as_int())
+        if hasattr(self, "check_mb_local_search_index"):
+            self.settings.mb_local_search_index_enabled = self.check_mb_local_search_index.get_active()
         if hasattr(self, "check_mb_fallback_official"):
             self.settings.mb_fallback_to_official = self.check_mb_fallback_official.get_active()
         self.settings.musicbrainz_server_url = build_musicbrainz_server_url(

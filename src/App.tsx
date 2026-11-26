@@ -141,6 +141,7 @@ const INITIAL_SETTINGS: ExportSettings = {
   mbUseLocalMirror: false,
   mbLocalHost: DEFAULT_MB_LOCAL_HOST,
   mbLocalPort: DEFAULT_MB_LOCAL_PORT,
+  mbLocalSearchIndexEnabled: false,
   mbFallbackToOfficial: true,
   mbLoadDeepRelations: false,
   preferSubgenres: true,
@@ -432,6 +433,7 @@ export default function App() {
     if (mbUrl && mbUrl !== DEFAULT_MUSICBRAINZ_SERVER_URL) {
       h['x-mb-server-url'] = mbUrl;
     }
+    h['x-mb-local-search-index'] = settings.mbLocalSearchIndexEnabled ? 'true' : 'false';
     h['x-mb-fallback-official'] = settings.mbFallbackToOfficial !== false ? 'true' : 'false';
     h['x-mb-deep-relations'] = settings.mbLoadDeepRelations ? 'true' : 'false';
     h['x-prefer-subgenres'] = settings.preferSubgenres !== false ? 'true' : 'false';
@@ -846,6 +848,22 @@ export default function App() {
       if (next.discogsToken !== prev.discogsToken)
         changes.push(
           `Discogs-Token: ${next.discogsToken?.trim() ? 'Persönliches Token hinterlegt' : 'Standard'}`
+        );
+      if (next.mbUseLocalMirror !== prev.mbUseLocalMirror)
+        changes.push(
+          `MusicBrainz-Server: ${next.mbUseLocalMirror ? `Lokaler Mirror (${next.mbLocalHost || DEFAULT_MB_LOCAL_HOST}:${next.mbLocalPort || DEFAULT_MB_LOCAL_PORT})` : 'Offizielle Server (musicbrainz.org)'}`
+        );
+      if (next.mbLocalHost !== prev.mbLocalHost || next.mbLocalPort !== prev.mbLocalPort)
+        changes.push(
+          `Lokaler MusicBrainz-Mirror: ${next.mbLocalHost || DEFAULT_MB_LOCAL_HOST}:${next.mbLocalPort || DEFAULT_MB_LOCAL_PORT}`
+        );
+      if (Boolean(next.mbLocalSearchIndexEnabled) !== Boolean(prev.mbLocalSearchIndexEnabled))
+        changes.push(
+          `Lokaler MusicBrainz-Suchindex (Solr): ${next.mbLocalSearchIndexEnabled ? 'Aktiviert' : 'Deaktiviert (Freitextsuchen über musicbrainz.org)'}`
+        );
+      if (next.mbFallbackToOfficial !== prev.mbFallbackToOfficial)
+        changes.push(
+          `MusicBrainz-Fallback auf musicbrainz.org: ${next.mbFallbackToOfficial !== false ? 'Ein' : 'Aus'}`
         );
       if (next.showQueryLog !== prev.showQueryLog)
         changes.push(
@@ -4927,6 +4945,9 @@ export default function App() {
               </div>
             ) : (
               queryLogs.map((line, i) => {
+                const isLocalQuery = /\[LOKAL\b/.test(line);
+                const isRemoteQuery = /\[ENTFERNT\b/.test(line);
+                const isCacheQuery = /\[CACHE\b/.test(line);
                 const isShazam = /shazam/i.test(line);
                 const isDiscogs = /discogs/i.test(line);
                 const isAmazon = /amazon|asin/i.test(line);
@@ -4939,17 +4960,23 @@ export default function App() {
                     className={
                       isErr
                         ? 'text-red-600 dark:text-red-400'
-                        : isShazam
-                          ? 'text-sky-700 dark:text-sky-300 font-semibold'
-                          : isDiscogs
-                            ? 'text-amber-700 dark:text-amber-300 font-semibold'
-                            : isAmazon
-                              ? 'text-orange-700 dark:text-orange-300 font-semibold'
-                              : isBatch
-                                ? 'text-[#2E6B14] dark:text-[#9BE270]'
-                                : isSettings
-                                  ? 'text-[#0969DA] dark:text-[#58A6FF]'
-                                  : 'text-[#24292F] dark:text-[#C9D1D9]'
+                        : isLocalQuery
+                          ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
+                          : isRemoteQuery
+                            ? 'text-blue-700 dark:text-blue-400 font-semibold'
+                            : isCacheQuery
+                              ? 'text-teal-700 dark:text-teal-400'
+                              : isShazam
+                                ? 'text-sky-700 dark:text-sky-300 font-semibold'
+                                : isDiscogs
+                                  ? 'text-amber-700 dark:text-amber-300 font-semibold'
+                                  : isAmazon
+                                    ? 'text-orange-700 dark:text-orange-300 font-semibold'
+                                    : isBatch
+                                      ? 'text-[#2E6B14] dark:text-[#9BE270]'
+                                      : isSettings
+                                        ? 'text-[#0969DA] dark:text-[#58A6FF]'
+                                        : 'text-[#24292F] dark:text-[#C9D1D9]'
                     }
                   >
                     {line}
@@ -5175,6 +5202,9 @@ export default function App() {
               </div>
             ) : (
               queryLogs.map((line, i) => {
+                const isLocalQuery = /\[LOKAL\b/.test(line);
+                const isRemoteQuery = /\[ENTFERNT\b/.test(line);
+                const isCacheQuery = /\[CACHE\b/.test(line);
                 const isShazam = /shazam/i.test(line);
                 const isDiscogs = /discogs/i.test(line);
                 const isAmazon = /amazon|asin/i.test(line);
@@ -5187,17 +5217,23 @@ export default function App() {
                     className={
                       isErr
                         ? 'text-red-600 dark:text-red-400'
-                        : isShazam
-                          ? 'text-sky-700 dark:text-sky-300 font-semibold'
-                          : isDiscogs
-                            ? 'text-amber-700 dark:text-amber-300 font-semibold'
-                            : isAmazon
-                              ? 'text-orange-700 dark:text-orange-300 font-semibold'
-                              : isBatch
-                                ? 'text-[#2E6B14] dark:text-[#9BE270]'
-                                : isSettings
-                                  ? 'text-[#0969DA] dark:text-[#58A6FF]'
-                                  : 'text-[#24292F] dark:text-[#C9D1D9]'
+                        : isLocalQuery
+                          ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
+                          : isRemoteQuery
+                            ? 'text-blue-700 dark:text-blue-400 font-semibold'
+                            : isCacheQuery
+                              ? 'text-teal-700 dark:text-teal-400'
+                              : isShazam
+                                ? 'text-sky-700 dark:text-sky-300 font-semibold'
+                                : isDiscogs
+                                  ? 'text-amber-700 dark:text-amber-300 font-semibold'
+                                  : isAmazon
+                                    ? 'text-orange-700 dark:text-orange-300 font-semibold'
+                                    : isBatch
+                                      ? 'text-[#2E6B14] dark:text-[#9BE270]'
+                                      : isSettings
+                                        ? 'text-[#0969DA] dark:text-[#58A6FF]'
+                                        : 'text-[#24292F] dark:text-[#C9D1D9]'
                     }
                   >
                     {line}
