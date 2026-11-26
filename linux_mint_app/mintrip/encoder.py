@@ -258,7 +258,12 @@ def _render_template_safe(template: str, mapping: dict[str, str], positional_fal
     return rendered.replace("{", "").replace("}", "")
 
 
-def build_target_stem(album: AlbumMetadata, track: TrackMetadata, settings: ExportSettings) -> Path:
+def build_target_stem(
+    album: AlbumMetadata,
+    track: TrackMetadata,
+    settings: ExportSettings,
+    format_override: Optional[str] = None,
+) -> Path:
     """Erzeugt den Ziel-Dateipfad ohne Dateiendung mit 2- bzw. 3-stelligen Titel- & CD-Nummern."""
     eff_disc = max(1, getattr(track, "disc_number", 0) or album.disc_number or 1)
     disc_tracks = [t for t in album.tracks if (getattr(t, "disc_number", 0) or album.disc_number or 1) == eff_disc]
@@ -297,7 +302,7 @@ def build_target_stem(album: AlbumMetadata, track: TrackMetadata, settings: Expo
     composer_clean = sanitize_segment((raw_composer.split(";")[0].strip() if raw_composer else "") or artist_clean)
     orchestra_clean = sanitize_segment((raw_orchestra.split(";")[0].strip() if raw_orchestra else "") or "Orchester")
     conductor_clean = sanitize_segment((raw_conductor.split(";")[0].strip() if raw_conductor else "") or "Dirigent")
-    fmt_clean = sanitize_segment(settings.export_format.value.upper())
+    fmt_clean = sanitize_segment((format_override or settings.export_format.value).upper())
     title_clean = sanitize_segment(track.title)
 
     mapping = {
@@ -1592,6 +1597,7 @@ def write_tags_to_existing_file(
     album: AlbumMetadata,
     track: TrackMetadata,
     settings: ExportSettings,
+    cover_dir: Optional[Path] = None,
 ) -> Path:
     """Schreibt Picard-Metadaten-Tags und das Cover nicht-destruktiv in eine bereits vorhandene Audiodatei, ohne bestehende Tags (z. B. ReplayGain, AcoustID, Custom-Tags) zu löschen."""
     if not file_path.exists():
@@ -1609,10 +1615,9 @@ def write_tags_to_existing_file(
                 album.cover_art_height = jpg_h
             if not album.cover_art_original_format:
                 album.cover_art_original_format = orig_fmt
-            cover_name = (settings.folder_cover_filename or "cover.jpg").strip() or "cover.jpg"
-            if not cover_name.lower().endswith((".jpg", ".jpeg")):
-                cover_name = f"{Path(cover_name).stem}.jpg"
-            folder_cover_path = file_path.parent / cover_name
+            target_cover_dir = cover_dir if cover_dir is not None else file_path.parent
+            target_cover_dir.mkdir(parents=True, exist_ok=True)
+            folder_cover_path = build_cover_target_path(target_cover_dir, album, settings)
             folder_cover_path.write_bytes(jpg_bytes)
         except Exception:
             pass

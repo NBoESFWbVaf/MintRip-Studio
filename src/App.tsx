@@ -1075,8 +1075,10 @@ export default function App() {
           if (job.stage === 'queued') {
             if (job.tagOnly) {
               changed = true;
-              const targetFile = job.sourceFileName || job.outputStem;
-              const statusMsg = `Picard-Tags & Cover werden direkt in „${targetFile}“ geschrieben...`;
+              const srcExtMatch = job.sourceFileName?.match(/\.([^.]+)$/);
+              const ext = (srcExtMatch?.[1] || job.exportFormat || 'flac').toLowerCase();
+              const targetFile = `${job.outputStem}.${ext}`;
+              const statusMsg = `Picard-Tags & Cover werden nach „${targetFile}“ geschrieben...`;
               stageLogs.push(
                 `[Tag-Writer] Titel #${String(job.trackNumber).padStart(2, '0')} „${job.trackTitle}“ → ${statusMsg}`
               );
@@ -1325,15 +1327,17 @@ export default function App() {
           if (job.stage === 'tagging') {
             changed = true;
             if (job.tagOnly) {
-              const outFile = job.sourceFileName || job.outputStem;
+              const srcExtMatch = job.sourceFileName?.match(/\.([^.]+)$/);
+              const ext = (srcExtMatch?.[1] || job.exportFormat || 'flac').toLowerCase();
+              const outFile = `${job.outputStem}.${ext}`;
               stageLogs.push(
-                `[Tag-Writer] Titel #${String(job.trackNumber).padStart(2, '0')} „${job.trackTitle}“ → Tags in Datei geschrieben (${outFile})`
+                `[Tag-Writer] Titel #${String(job.trackNumber).padStart(2, '0')} „${job.trackTitle}“ → Tags geschrieben (${outFile})`
               );
               return {
                 ...job,
                 stage: 'done' as const,
                 progress: 1,
-                statusMessage: `Tags geschrieben (${outFile})`,
+                statusMessage: `Tags geschrieben → ${outFile}`,
                 outputFiles: [outFile],
               };
             }
@@ -3729,13 +3733,13 @@ export default function App() {
           normalizeAlbum: settings.normalizeAlbum,
           normalizeTargetLufs: settings.normalizeTargetLufs,
           flacCompressionLevel: settings.flacCompressionLevel,
-          outputStem: trk.sourceFileName || formatOutputStem(album, trk, settings),
+          outputStem: formatOutputStem(album, trk, settings),
           sourceKind: 'local_file',
           tagOnly: true,
           sourceFileName: trk.sourceFileName,
           stage: 'queued',
           progress: 0,
-          statusMessage: `Bereit zum Tag-Schreiben (${trk.sourceFileName})`,
+          statusMessage: `Bereit zum Taggen (${trk.sourceFileName} → ${settings.outputDirTag || DEFAULT_MODULE_OUTPUT_DIRS.outputDirTag})`,
           outputFiles: [],
         };
       });
@@ -4140,9 +4144,7 @@ export default function App() {
         normalizeAlbum: effSettings.normalizeAlbum,
         normalizeTargetLufs: effSettings.normalizeTargetLufs,
         flacCompressionLevel: effSettings.flacCompressionLevel,
-        outputStem: isTagOnly
-          ? trk.sourceFileName || formatOutputStem(album, trk, effSettings)
-          : formatOutputStem(album, trk, effSettings),
+        outputStem: formatOutputStem(album, trk, effSettings),
         sourceKind: isLocalFile ? 'local_file' : 'cdparanoia',
         tagOnly: isTagOnly,
         sourceFileName: trk.sourceFileName,
@@ -4153,7 +4155,7 @@ export default function App() {
         statusMessage: convertToFlac
           ? `Wartet: ${trk.sourceFileName} → WAV → FLAC (Tags beibehalten)`
           : isLocalFile
-            ? `Bereit zum Tag-Schreiben (${trk.sourceFileName})`
+            ? `Bereit zum Taggen (${trk.sourceFileName} → ${effSettings.outputDirTag || DEFAULT_MODULE_OUTPUT_DIRS.outputDirTag})`
             : 'Wartet auf cdparanoia',
         outputFiles: [],
       };

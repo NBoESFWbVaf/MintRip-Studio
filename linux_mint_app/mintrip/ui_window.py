@@ -10635,11 +10635,12 @@ class MintRipWindow(Gtk.ApplicationWindow):
         from dataclasses import replace
 
         active_mod = getattr(self, "_active_module", "")
-        target_out_dir = (
+        raw_out_dir = (
             getattr(self.settings, "output_dir_tag", DEFAULT_OUTPUT_DIR_TAG)
-            if active_mod == "module_tag"
+            if (active_mod == "module_tag" or is_imported_only)
             else getattr(self.settings, "output_dir_rip", self.settings.output_dir)
         )
+        target_out_dir = Path(str(raw_out_dir or DEFAULT_OUTPUT_DIR_TAG)).expanduser()
         job_settings = replace(
             self.settings,
             output_dir=target_out_dir,
@@ -10669,7 +10670,7 @@ class MintRipWindow(Gtk.ApplicationWindow):
                 status_message=f"Wartet: {track.source_file.name} → WAV → FLAC (Tags beibehalten)"
                 if convert_local_to_flac and track.source_file
                 else (
-                    f"Bereit zum Tag-Schreiben ({track.source_file.name})"
+                    f"Bereit zum Taggen ({track.source_file.name} → {target_out_dir})"
                     if is_local and track.source_file
                     else "Bereit"
                 ),
@@ -10688,12 +10689,13 @@ class MintRipWindow(Gtk.ApplicationWindow):
             if convert_local_to_flac:
                 self._append_query_log_ui(
                     f"[WAV→FLAC] {enqueued_count} importierte Datei(en) von „{self.album.artist} – {self.album.title}“ "
-                    f"zur 2-Schritt-Umwandlung (erst nach WAV, danach nach FLAC · Bitraten exakt · Tags & Cover beibehalten) gestartet."
+                    f"zur 2-Schritt-Umwandlung (erst nach WAV, danach nach FLAC · Bitraten exakt · Tags & Cover beibehalten) "
+                    f"in Zielordner „{target_out_dir}“ gestartet."
                 )
             elif is_imported_only:
                 self._append_query_log_ui(
                     f"[Tag-Writer] {enqueued_count} importierte Datei(en) von „{self.album.artist} – {self.album.title}“ "
-                    f"zum direkten Tag-Schreiben (ohne Re-Rip) gestartet."
+                    f"zum Taggen in Zielordner „{target_out_dir}“ gestartet."
                 )
             else:
                 self._append_query_log_ui(

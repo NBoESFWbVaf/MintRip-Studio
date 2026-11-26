@@ -355,25 +355,68 @@ class BatchQueueManager:
 
     def _tag_only_stage(self, job: BatchJob) -> None:
         self._wait_if_paused()
-        if not job.track.source_file or not job.track.source_file.exists():
+        src_path = job.track.source_file
+        if not src_path or not src_path.exists():
             raise FileNotFoundError("Importierte Quelldatei für Tag-Schreibvorgang nicht gefunden.")
 
-        job.output_files.clear()
-        job.stage = BatchStage.TAGGING
-        job.progress = 0.65
-        job.status_message = f"Picard-Tags & Cover in {job.track.source_file.name} schreiben..."
-        self._notify(job)
-
-        out_path = write_tags_to_existing_file(
-            job.track.source_file,
+        src_ext = src_path.suffix or ".flac"
+        fmt_override = src_ext.lstrip(".").upper() or None
+        stem = build_target_stem(
             job.album,
             job.track,
             job.settings,
+            format_override=fmt_override,
         )
+        target_path = stem.with_suffix(src_ext)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        same_file = False
+        try:
+            same_file = src_path.resolve() == target_path.resolve()
+        except Exception:
+            same_file = False
+
+        job.output_files.clear()
+        job.stage = BatchStage.TAGGING
+        job.progress = 0.55
+        job.status_message = f"Picard-Tags & Cover → {target_path.name} schreiben..."
+        self._notify(job)
+
+        if same_file:
+            out_path = write_tags_to_existing_file(
+                target_path,
+                job.album,
+                job.track,
+                job.settings,
+                cover_dir=target_path.parent,
+            )
+        else:
+            tmp_target = target_path.with_name(f".{target_path.stem}.mintrip_tmp{src_ext}")
+            try:
+                shutil.copy2(str(src_path), str(tmp_target))
+                job.progress = 0.78
+                self._notify(job)
+                write_tags_to_existing_file(
+                    tmp_target,
+                    job.album,
+                    job.track,
+                    job.settings,
+                    cover_dir=target_path.parent,
+                )
+                os.replace(str(tmp_target), str(target_path))
+                out_path = target_path
+            except Exception:
+                try:
+                    if tmp_target.exists():
+                        tmp_target.unlink()
+                except Exception:
+                    pass
+                raise
+
         job.output_files.append(out_path)
         job.stage = BatchStage.DONE
         job.progress = 1.0
-        job.status_message = f"Tags geschrieben ({out_path.name})"
+        job.status_message = f"Tags geschrieben → {out_path}"
         self._submitted_ids.discard(job.job_id)
         self._notify(job)
 
